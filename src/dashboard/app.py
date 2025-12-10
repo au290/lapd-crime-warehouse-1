@@ -2,14 +2,13 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import pydeck as pdk
-import duckdb
 import joblib
-from prophet import Prophet
-from minio import Minio
+from sqlalchemy import create_engine, text
 from io import BytesIO
+import os
 from datetime import datetime, timedelta
 
-# --- 1. KONFIGURASI HALAMAN ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(
     page_title="LAPD Crime Intelligence",
     page_icon="🚔",
@@ -17,169 +16,123 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 2. ENGINE KONEKSI (DuckDB + MinIO) ---
+# --- 2. WAREHOUSE CONNECTION ---
 @st.cache_resource
-def get_minio_client():
-    return Minio(
-        "minio:9000",
-        access_key="minioadmin",
-        secret_key="minioadmin",
-        secure=False
-    )
+def get_db_engine():
+    # Connects to the 'warehouse' container
+    db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
+    return create_engine(db_conn)
 
-@st.cache_resource
-def get_db_connection():
-    # In-memory OLAP database
-    con = duckdb.connect(database=':memory:')
-    
-    # Setup koneksi S3 ke MinIO
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute("""
-        SET s3_endpoint='minio:9000';
-        SET s3_use_ssl=false;
-        SET s3_access_key_id='minioadmin';
-        SET s3_secret_access_key='minioadmin';
-        SET s3_url_style='path';
-    """)
-    return con
-
-# --- 3. LOAD MODEL AI (FORECASTING) ---
+# --- 3. LOAD MODEL (FROM DB BLOB) ---
 @st.cache_data(ttl=3600)
 def load_forecast_model():
-    client = get_minio_client()
+    engine = get_db_engine()
     try:
-        # Cek apakah model ada
-        client.stat_object("crime-models", "prophet_crime_v1.joblib")
+        # Get the latest model binary from the registry table
+        query = text("""
+            SELECT model_blob 
+            FROM gold.model_registry 
+            WHERE model_name = 'prophet_crime_v1' 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """)
         
-        # Download model
-        response = client.get_object("crime-models", "prophet_crime_v1.joblib")
-        m = joblib.load(BytesIO(response.read()))
-        response.close()
-        response.release_conn()
-        
-        # --- LOGIKA BARU: BRIDGING THE GAP ---
-        # 1. Cek tanggal terakhir data training
-        last_train_date = m.history['ds'].max()
-        
-        # 2. Tentukan target prediksi (Hari ini + 30 hari)
-        today = pd.to_datetime('today')
-        target_date = today + timedelta(days=30)
-        
-        # 3. Hitung berapa hari yang harus diprediksi dari data terakhir sampai target
-        days_to_predict = (target_date - last_train_date).days
-        if days_to_predict < 1: days_to_predict = 30
+        with engine.connect() as conn:
+            result = conn.execute(query).fetchone()
             
-        # 4. Buat prediksi panjang
-        future = m.make_future_dataframe(periods=days_to_predict)
-        forecast = m.predict(future)
-        
-        # 5. Filter Output (Tampilkan 60 hari lalu s/d 30 hari depan)
-        start_view = today - timedelta(days=60)
-        mask = forecast['ds'] >= start_view
-        
-        return forecast.loc[mask, ['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-    except Exception:
+        if result and result[0]:
+            # Deserialize model
+            m = joblib.load(BytesIO(result[0]))
+            
+            # Predict
+            today = pd.to_datetime('today')
+            future = m.make_future_dataframe(periods=30)
+            forecast = m.predict(future)
+            
+            # Filter: Show last 60 days + next 30 days
+            start_view = today - timedelta(days=60)
+            mask = forecast['ds'] >= start_view
+            
+            return forecast.loc[mask, ['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+    except Exception as e:
+        print(f"⚠️ Model Load Error: {e}")
         return pd.DataFrame()
+    return pd.DataFrame()
 
-# --- 4. LOAD METRICS ML ---
-def load_model_metrics():
-    client = get_minio_client()
+# --- 4. DATA LOADERS (SQL) ---
+def load_filter_options(engine):
     try:
-        import json
-        response = client.get_object("crime-models", "model_metrics.json")
-        return json.load(BytesIO(response.read()))
-    except:
-        return None
-
-# --- 5. DATA LOADER (Metadata) ---
-def load_filter_options(con):
-    try:
-        dates = con.execute("SELECT min(date_occ), max(date_occ) FROM read_parquet('s3://crime-gold/fact_crime.parquet')").fetchone()
-        areas = con.execute("SELECT DISTINCT area_name FROM read_parquet('s3://crime-gold/dim_area.parquet') ORDER BY 1").df()
-        crimes = con.execute("SELECT DISTINCT crm_cd_desc FROM read_parquet('s3://crime-gold/dim_crime.parquet') ORDER BY 1").df()
+        with engine.connect() as conn:
+            dates = pd.read_sql("SELECT min(date_occ), max(date_occ) FROM gold.fact_crime", conn).iloc[0]
+            areas = pd.read_sql("SELECT DISTINCT area_name FROM gold.dim_area ORDER BY 1", conn)
+            crimes = pd.read_sql("SELECT DISTINCT crm_cd_desc FROM gold.dim_crime ORDER BY 1", conn)
         return dates, areas['area_name'].tolist(), crimes['crm_cd_desc'].tolist()
     except Exception:
         return None, [], []
 
-# --- 6. DATA ENGINE ---
-
-# A. Query Detail (Limit 50k untuk Peta)
-def query_analytical_data(con, start_date, end_date, selected_areas, selected_crimes):
-    where_clauses = [f"f.date_occ BETWEEN '{start_date}' AND '{end_date}'"]
-    
-    if selected_areas:
-        areas_str = "', '".join(selected_areas)
-        where_clauses.append(f"da.area_name IN ('{areas_str}')")
-        
-    if selected_crimes:
-        safe_crimes = [c.replace("'", "''") for c in selected_crimes]
-        crimes_str = "', '".join(safe_crimes)
-        where_clauses.append(f"dc.crm_cd_desc IN ('{crimes_str}')")
-
-    where_stmt = " AND ".join(where_clauses)
-
-    sql = f"""
+# --- 5. ANALYTICAL QUERIES (SQL) ---
+def query_analytical_data(engine, start_date, end_date, selected_areas, selected_crimes):
+    query = """
         SELECT 
-            f.date_occ,
-            da.area_name,
-            dc.crm_cd_desc,
-            dw.weapon_desc,
-            ds.status_desc,
-            f.vict_age,
-            f.lat,
-            f.lon
-        FROM read_parquet('s3://crime-gold/fact_crime.parquet') f
-        LEFT JOIN read_parquet('s3://crime-gold/dim_area.parquet') da ON f.area_id = da.area_id
-        LEFT JOIN read_parquet('s3://crime-gold/dim_crime.parquet') dc ON f.crm_cd = dc.crm_cd
-        LEFT JOIN read_parquet('s3://crime-gold/dim_status.parquet') ds ON f.status_id = ds.status_id
-        LEFT JOIN read_parquet('s3://crime-gold/dim_weapon.parquet') dw ON f.weapon_id = dw.weapon_id
-        WHERE {where_stmt}
-        AND f.lat != 0 AND f.lon != 0 
-        LIMIT 50000
+            f.date_occ, da.area_name, dc.crm_cd_desc, 
+            ds.status_desc, dw.weapon_desc, f.vict_age, f.lat, f.lon
+        FROM gold.fact_crime f
+        LEFT JOIN gold.dim_area da ON f.area_id = da.area_id
+        LEFT JOIN gold.dim_crime dc ON f.crm_cd = dc.crm_cd
+        LEFT JOIN gold.dim_status ds ON f.status_id = ds.status_id
+        LEFT JOIN gold.dim_weapon dw ON f.weapon_id = dw.weapon_id
+        WHERE f.date_occ BETWEEN %(start)s AND %(end)s
+        AND f.lat != 0 AND f.lon != 0
     """
-    return con.execute(sql).df()
-
-# B. Query Tren (Full History)
-def query_trend_data(con, start_date, end_date, selected_areas, selected_crimes):
-    where_clauses = [f"f.date_occ BETWEEN '{start_date}' AND '{end_date}'"]
+    params = {'start': start_date, 'end': end_date}
+    
     if selected_areas:
-        areas_str = "', '".join(selected_areas)
-        where_clauses.append(f"da.area_name IN ('{areas_str}')")
+        query += " AND da.area_name IN %(areas)s"
+        params['areas'] = tuple(selected_areas)
     if selected_crimes:
-        safe_crimes = [c.replace("'", "''") for c in selected_crimes]
-        crimes_str = "', '".join(safe_crimes)
-        where_clauses.append(f"dc.crm_cd_desc IN ('{crimes_str}')")
-    
-    where_stmt = " AND ".join(where_clauses)
-    
-    sql = f"""
-        SELECT f.date_occ, count(*) as Jumlah
-        FROM read_parquet('s3://crime-gold/fact_crime.parquet') f
-        LEFT JOIN read_parquet('s3://crime-gold/dim_area.parquet') da ON f.area_id = da.area_id
-        LEFT JOIN read_parquet('s3://crime-gold/dim_crime.parquet') dc ON f.crm_cd = dc.crm_cd
-        WHERE {where_stmt}
-        GROUP BY f.date_occ
-        ORDER BY f.date_occ
-    """
-    return con.execute(sql).df()
+        query += " AND dc.crm_cd_desc IN %(crimes)s"
+        params['crimes'] = tuple(selected_crimes)
 
-def query_kpi_stats(con, start_date, end_date):
-    sql = f"""
+    query += " LIMIT 50000"
+    return pd.read_sql(query, engine, params=params)
+
+def query_trend_data(engine, start_date, end_date, selected_areas, selected_crimes):
+    query = """
+        SELECT f.date_occ, count(*) as "Jumlah"
+        FROM gold.fact_crime f
+        LEFT JOIN gold.dim_area da ON f.area_id = da.area_id
+        LEFT JOIN gold.dim_crime dc ON f.crm_cd = dc.crm_cd
+        WHERE f.date_occ BETWEEN %(start)s AND %(end)s
+    """
+    params = {'start': start_date, 'end': end_date}
+    
+    if selected_areas:
+        query += " AND da.area_name IN %(areas)s"
+        params['areas'] = tuple(selected_areas)
+    if selected_crimes:
+        query += " AND dc.crm_cd_desc IN %(crimes)s"
+        params['crimes'] = tuple(selected_crimes)
+        
+    query += " GROUP BY f.date_occ ORDER BY f.date_occ"
+    return pd.read_sql(query, engine, params=params)
+
+def query_kpi_stats(engine, start_date, end_date):
+    query = """
         SELECT count(*) as total_cases, avg(vict_age) as avg_age
-        FROM read_parquet('s3://crime-gold/fact_crime.parquet')
-        WHERE date_occ BETWEEN '{start_date}' AND '{end_date}'
+        FROM gold.fact_crime
+        WHERE date_occ BETWEEN %(start)s AND %(end)s
     """
-    return con.execute(sql).df()
+    return pd.read_sql(query, engine, params={'start': start_date, 'end': end_date})
 
-# --- 7. UI UTAMA ---
+# --- 6. UI MAIN ---
 def main():
-    con = get_db_connection()
+    engine = get_db_engine()
     
     st.sidebar.title("🔍 Filter Panel")
-    dates, area_opts, crime_opts = load_filter_options(con)
+    dates, area_opts, crime_opts = load_filter_options(engine)
     
-    if not dates or not dates[0]:
-        st.error("Gagal terhubung ke Data Warehouse.")
+    if dates is None:
+        st.error("Gagal terhubung ke Data Warehouse (Postgres).")
         st.stop()
 
     min_d, max_d = dates
@@ -187,139 +140,59 @@ def main():
     sel_areas = st.sidebar.multiselect("Wilayah (Area)", area_opts)
     sel_crimes = st.sidebar.multiselect("Jenis Kejahatan", crime_opts)
     
-    st.sidebar.markdown("---")
-    st.sidebar.info("💡 **Tips:** Tab 'AI Forecast' berisi prediksi untuk bulan depan.")
-
     st.title("🚔 LAPD Crime Intelligence")
-    st.caption(f"Data Analisis Periode: {s_date} s/d {e_date}")
+    st.caption(f"Warehouse Mode | Data: {s_date} s/d {e_date}")
 
-    with st.spinner("Processing data..."):
-        df = query_analytical_data(con, s_date, e_date, sel_areas, sel_crimes)
-        df_trend = query_trend_data(con, s_date, e_date, sel_areas, sel_crimes)
-        kpi_df = query_kpi_stats(con, s_date, e_date)
-        forecast_df = load_forecast_model() # Load Prediksi ML
+    with st.spinner("Executing SQL Queries..."):
+        df = query_analytical_data(engine, s_date, e_date, sel_areas, sel_crimes)
+        df_trend = query_trend_data(engine, s_date, e_date, sel_areas, sel_crimes)
+        kpi_df = query_kpi_stats(engine, s_date, e_date)
+        forecast_df = load_forecast_model()
 
     if df.empty:
-        st.warning("Tidak ada data.")
+        st.warning("Tidak ada data ditemukan.")
         return
 
-    # KPI
-    col1, col2, col3, col4 = st.columns(4)
-    total_cases = kpi_df['total_cases'][0]
-    col1.metric("Total Kasus", f"{total_cases:,}", delta_color="off")
-    
-    top_crime = df['crm_cd_desc'].mode()[0] if not df.empty else "-"
-    col2.metric("Top Kejahatan", top_crime[:15] + "..." if len(top_crime)>15 else top_crime)
-    
+    # KPI Metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Kasus", f"{kpi_df['total_cases'][0]:,}")
+    c2.metric("Avg Umur", f"{round(kpi_df['avg_age'][0] or 0)} Thn")
     top_area = df['area_name'].mode()[0] if not df.empty else "-"
-    col3.metric("Area Hotspot", top_area)
-    
-    avg_age = round(kpi_df['avg_age'][0] or 0)
-    col4.metric("Avg Umur", f"{avg_age} Thn")
+    c3.metric("Hotspot Area", top_area)
+    top_crime = df['crm_cd_desc'].mode()[0] if not df.empty else "-"
+    c4.metric("Top Crime", top_crime[:15]+"..." if len(top_crime)>15 else top_crime)
 
-    st.markdown("---")
+    st.divider()
 
-    # --- TABS LAYOUT ---
     tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Peta", "📈 Grafik", "📋 Data", "🤖 AI Forecast"])
 
-    # TAB 1: PETA
     with tab1:
-        st.subheader("Peta Konsentrasi Kriminalitas")
-        COLOR_RANGE = [
-            [65, 182, 196], [127, 205, 187], [199, 233, 180],
-            [237, 248, 177], [254, 224, 139], [253, 174, 97],
-            [244, 109, 67], [215, 48, 39]
-        ]
-        layer_heatmap = pdk.Layer(
-            "HeatmapLayer",
-            data=df,
-            get_position=["lon", "lat"],
-            opacity=0.8,
-            radiusPixels=40,
-            colorRange=COLOR_RANGE,
-            threshold=0.05,
-            pickable=True,
-        )
-        layer_scatter = pdk.Layer(
-            "ScatterplotLayer",
-            data=df,
-            get_position=["lon", "lat"],
-            get_color="[255, 255, 255, 150]",
-            get_radius=30,
-            pickable=True,
-        )
-        view_state = pdk.ViewState(latitude=34.05, longitude=-118.24, zoom=9.5, pitch=0)
-        tooltip = {"html": "<b>Area:</b> {area_name}<br/><b>Kejahatan:</b> {crm_cd_desc}"}
-        r = pdk.Deck(layers=[layer_heatmap], initial_view_state=view_state, map_style="light", tooltip=tooltip)
-        
-        c_map_main, c_map_ctrl = st.columns([3, 1])
-        with c_map_ctrl:
-            show_points = st.checkbox("Tampilkan Titik Kasus", value=False)
-            if show_points: r.layers.append(layer_scatter)
-        with c_map_main:
-            st.pydeck_chart(r)
+        st.subheader("Geospatial Distribution")
+        st.pydeck_chart(pdk.Deck(
+            map_style="mapbox://styles/mapbox/light-v9",
+            initial_view_state=pdk.ViewState(latitude=34.05, longitude=-118.24, zoom=9.5),
+            layers=[
+                pdk.Layer("HeatmapLayer", df, get_position=["lon", "lat"], opacity=0.8, radiusPixels=40),
+                pdk.Layer("ScatterplotLayer", df, get_position=["lon", "lat"], get_color="[200, 30, 0, 160]", get_radius=30)
+            ]
+        ))
 
-    # TAB 2: GRAFIK
     with tab2:
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.subheader("Tren Harian (Full History)")
-            if not df_trend.empty:
-                fig_line = px.area(df_trend, x='date_occ', y='Jumlah', template="plotly_dark")
-                fig_line.update_layout(height=350)
-                st.plotly_chart(fig_line, use_container_width=True)
-        with c2:
-            st.subheader("Proporsi Status")
-            if not df.empty:
-                status_cnt = df['status_desc'].value_counts().reset_index()
-                status_cnt.columns = ['Status', 'Jumlah']
-                fig_pie = px.pie(status_cnt, values='Jumlah', names='Status', hole=0.5, template="plotly_dark")
-                fig_pie.update_layout(showlegend=False, height=350)
-                st.plotly_chart(fig_pie, use_container_width=True)
-        
-        st.subheader("Analisis Senjata")
-        if 'weapon_desc' in df.columns:
-            matriks = pd.crosstab(df['crm_cd_desc'], df['weapon_desc'])
-            top_c = matriks.sum(axis=1).sort_values(ascending=False).head(10).index
-            top_w = matriks.sum(axis=0).sort_values(ascending=False).head(10).index
-            fig_heat = px.imshow(matriks.loc[top_c, top_w], text_auto=True, aspect="auto", color_continuous_scale="Viridis", template="plotly_dark")
-            st.plotly_chart(fig_heat, use_container_width=True)
+        if not df_trend.empty:
+            st.plotly_chart(px.area(df_trend, x='date_occ', y='Jumlah', template="plotly_dark"), use_container_width=True)
 
-    # TAB 3: DATA
     with tab3:
-        st.dataframe(df.sort_values(by='date_occ', ascending=False), use_container_width=True)
+        st.dataframe(df.head(1000), use_container_width=True)
 
-    # TAB 4: AI FORECAST
     with tab4:
-        st.subheader("🤖 Prediksi Kriminalitas (Prophet AI)")
-        
-        metrics = load_model_metrics()
-        if metrics:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("MAE (Rata-rata Meleset)", f"{metrics['mae']:.1f} Kasus")
-            m2.metric("Akurasi Model", f"{100 - metrics['mape']:.1f}%")
-            m3.caption(f"Last Trained: {metrics['last_trained']}")
-            st.divider()
-
+        st.subheader("🤖 Prophet Forecasting")
         if not forecast_df.empty:
-            fig_forecast = px.line(forecast_df, x='ds', y='yhat', labels={'ds': 'Tanggal', 'yhat': 'Prediksi Jumlah Kasus'}, template="plotly_dark")
-            
-            fig_forecast.add_scatter(
-                x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', 
-                line=dict(width=0), showlegend=False, name='Upper Bound'
-            )
-            fig_forecast.add_scatter(
-                x=forecast_df['ds'], y=forecast_df['yhat_lower'], mode='lines', 
-                line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 173, 181, 0.2)', 
-                showlegend=False, name='Lower Bound'
-            )
-            
-            fig_forecast.update_layout(title="Forecast 30 Hari Kedepan")
-            st.plotly_chart(fig_forecast, use_container_width=True)
-            
-            st.info("ℹ️ **Info:** Grafik ini menampilkan estimasi jumlah kasus di masa depan berdasarkan tren historis.")
+            fig = px.line(forecast_df, x='ds', y='yhat', template="plotly_dark")
+            fig.add_scatter(x=forecast_df['ds'], y=forecast_df['yhat_lower'], mode='lines', line=dict(width=0), showlegend=False)
+            fig.add_scatter(x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0,100,80,0.2)', showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Model prediksi belum tersedia. Pastikan DAG '3_train_forecasting_model' sudah dijalankan di Airflow.")
+            st.warning("Model belum tersedia di Database (gold.model_registry).")
 
 if __name__ == "__main__":
     main()

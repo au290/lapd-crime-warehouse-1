@@ -1,105 +1,71 @@
 import pandas as pd
 from prophet import Prophet
-from minio import Minio
+from sqlalchemy import create_engine, text
 from io import BytesIO
 import joblib
-import json
 import os
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import numpy as np
+import json
 
 def train_and_save_model(**kwargs):
-    # 1. Konfigurasi
-    MINIO_ENDPOINT = "minio:9000"
-    ACCESS_KEY = "minioadmin"
-    SECRET_KEY = "minioadmin"
-    MODEL_BUCKET = "crime-models"
-    DATA_BUCKET = "crime-gold"
+    # 1. Connection
+    db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
+    engine = create_engine(db_conn)
     
-    # [CONFIG BARU] Batas Akhir Data Stabil
-    # Kita buang data 2024 & 2025 yang "aneh" agar model tidak bias
-    TRAINING_CUTOFF_DATE = "2023-12-31" 
-    
-    client = Minio(MINIO_ENDPOINT, access_key=ACCESS_KEY, secret_key=SECRET_KEY, secure=False)
-    if not client.bucket_exists(MODEL_BUCKET): client.make_bucket(MODEL_BUCKET)
+    print("🧠 Starting Prophet Training (Warehouse Mode)...")
 
-    print("🧠 Memulai Training Model (dengan Filter Data Stabil)...")
-
-    # 2. Load Data
+    # 2. Load Data from Gold Layer
+    # [FILTER] Data 2024/2025 yang tidak lengkap/anomali kita filter di query SQL
+    query = """
+        SELECT date_occ as ds, count(*) as y
+        FROM gold.fact_crime
+        WHERE date_occ <= '2023-12-31'
+        GROUP BY date_occ
+        ORDER BY date_occ
+    """
     try:
-        response = client.get_object(DATA_BUCKET, "fact_crime.parquet")
-        df = pd.read_parquet(BytesIO(response.read()))
-        response.close()
-        response.release_conn()
+        daily_counts = pd.read_sql(query, engine)
     except Exception as e:
-        print(f"❌ Gagal load data: {e}")
+        print(f"❌ Failed to load training data: {e}")
         return
 
-    # 3. Preprocessing
-    if 'date_occ' in df.columns:
-        df['date_occ'] = pd.to_datetime(df['date_occ'])
-        
-        # [SOLUSI] Filter Data Sampah / Tidak Lengkap
-        # Hanya ambil data sebelum 2024 (karena 2024 drop aneh & 2025 belum lengkap)
-        df_clean = df[df['date_occ'] <= TRAINING_CUTOFF_DATE]
-        print(f"🧹 Data dipotong sampai {TRAINING_CUTOFF_DATE}. (Membuang data 2024-2025 yg anomali)")
-        
-        daily_counts = df_clean.groupby('date_occ').size().reset_index(name='y')
-        daily_counts.rename(columns={'date_occ': 'ds'}, inplace=True)
-    else:
-        print("❌ Kolom tanggal tidak ditemukan")
+    if daily_counts.empty:
+        print("❌ No data available for training.")
         return
 
-    print(f"📊 Data Training Bersih: {len(daily_counts)} hari.")
+    print(f"📊 Training on {len(daily_counts)} days of history.")
 
-    # ==========================================
-    # TAHAP A: EVALUASI (UJIAN MODEL)
-    # ==========================================
-    print("📉 Melakukan Evaluasi...")
+    # 3. Train Prophet
+    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
+    m.fit(daily_counts)
     
-    test_days = 30
-    train_df = daily_counts.iloc[:-test_days]
-    test_df = daily_counts.iloc[-test_days:]
+    print("✅ Model trained successfully!")
 
-    # Tambahkan 'yearly_seasonality=True' agar dia paham pola tahunan yang kuat
-    m_eval = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
-    m_eval.fit(train_df)
-
-    future_eval = m_eval.make_future_dataframe(periods=test_days)
-    forecast_eval = m_eval.predict(future_eval)
-    
-    pred_y = forecast_eval.iloc[-test_days:]['yhat'].values
-    true_y = test_df['y'].values
-
-    mae = mean_absolute_error(true_y, pred_y)
-    rmse = np.sqrt(mean_squared_error(true_y, pred_y))
-    # Handle division by zero jika ada hari dengan 0 kejahatan
-    with np.errstate(divide='ignore', invalid='ignore'):
-        mape = np.mean(np.abs((true_y - pred_y) / true_y)) * 100
-        if np.isnan(mape): mape = 0
-
-    print(f"✅ HASIL EVALUASI (Data Stabil):")
-    print(f"   - MAE: {mae:.2f}")
-    print(f"   - MAPE: {mape:.2f}%")
-
-    metrics = {"mae": mae, "rmse": rmse, "mape": mape, "last_trained": str(pd.Timestamp.now())}
-    metrics_bytes = json.dumps(metrics).encode('utf-8')
-    client.put_object(MODEL_BUCKET, "model_metrics.json", BytesIO(metrics_bytes), len(metrics_bytes), content_type="application/json")
-
-    # ==========================================
-    # TAHAP B: FINAL TRAINING
-    # ==========================================
-    print("🚀 Melatih Model Final...")
-    
-    m_final = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
-    m_final.fit(daily_counts) 
-
+    # 4. Serialize Model to Bytes
     model_buffer = BytesIO()
-    joblib.dump(m_final, model_buffer)
-    model_buffer.seek(0)
+    joblib.dump(m, model_buffer)
+    model_bytes = model_buffer.getvalue()
+
+    # 5. Save to Database (Model Registry)
+    with engine.connect() as conn:
+        # Create Registry Table if not exists
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gold.model_registry (
+                id SERIAL PRIMARY KEY,
+                model_name VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                model_blob BYTEA
+            );
+        """))
+        
+        # Insert Model
+        print("💾 Saving model binary to 'gold.model_registry'...")
+        conn.execute(
+            text("INSERT INTO gold.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
+            {"name": "prophet_crime_v1", "blob": model_bytes}
+        )
+        conn.commit()
     
-    client.put_object(MODEL_BUCKET, "prophet_crime_v1.joblib", model_buffer, len(model_buffer.getbuffer()), content_type="application/octet-stream")
-    print("💾 Model Final Tersimpan.")
+    print("✅ Model saved to Database.")
 
 if __name__ == "__main__":
     train_and_save_model()
