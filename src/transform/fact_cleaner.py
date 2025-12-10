@@ -19,9 +19,13 @@ def load_lake_to_staging(**kwargs):
     
     # 2. Get Latest File from Lake
     bucket = "raw-lake"
-    objects = minio_client.list_objects(bucket)
-    # Sort by last modified to get the newest file
-    latest_obj = max(objects, key=lambda x: x.last_modified, default=None)
+    try:
+        objects = minio_client.list_objects(bucket)
+        # Sort by last modified to get the newest file
+        latest_obj = max(objects, key=lambda x: x.last_modified, default=None)
+    except Exception as e:
+        print(f"⚠️ Error accessing MinIO: {e}")
+        return
     
     if not latest_obj:
         print("⚠️ Data Lake is empty.")
@@ -34,6 +38,10 @@ def load_lake_to_staging(**kwargs):
     response.release_conn()
 
     df = pd.DataFrame(data)
+
+    if df.empty:
+        print("⚠️ Extracted data is empty.")
+        return
 
     # 3. Basic Cleaning for Staging
     df.columns = df.columns.str.lower().str.replace(' ', '_')
@@ -56,8 +64,10 @@ def load_lake_to_staging(**kwargs):
     print("🚚 Loading into 'staging.crime_buffer'...")
     with engine.connect() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
+        # [CRITICAL FIX] Drop table dengan CASCADE untuk membersihkan tipe data lama yang orphan
+        conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
         
-    # 'replace' drops the table and recreates it (Truncate equivalent)
+    # Gunakan 'replace' (aman karena kita sudah drop manual sebelumnya)
     df.to_sql('crime_buffer', engine, schema='staging', if_exists='replace', index=False)
     print(f"✅ Loaded {len(df)} rows to Staging.")
 

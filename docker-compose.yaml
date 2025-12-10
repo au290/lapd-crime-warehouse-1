@@ -12,7 +12,8 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__WEBSERVER__SECRET_KEY: 'secret_key'
-    DISCORD_WEBHOOK_URL: "YOUR_DISCORD_WEBHOOK_HERE"
+    # [FIX] URL Webhook asli Anda dimasukkan di sini
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1447839141063692341/ue-nFshTa5CgxdJ2gEeiU2iwbxiLH0iE9Ievfk5xnnPZ1D82NIVnFwBmDH4dTbhdDMYF"
     # Connections
     WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
     MINIO_ENDPOINT: minio:9000

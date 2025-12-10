@@ -45,9 +45,19 @@ def merge_staging_to_warehouse(**kwargs):
             """))
 
             # Insert new records (Ignore duplicates via ON CONFLICT)
+            # [FIX] Casting Text ke Float menggunakan ::FLOAT
+            # NULLIF(lat, '') berguna jika ada data kosong berupa string kosong agar jadi NULL
             conn.execute(text("""
                 INSERT INTO warehouse.fact_crime (dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age)
-                SELECT DISTINCT dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age 
+                SELECT DISTINCT 
+                    dr_no, 
+                    date_occ, 
+                    area_id, 
+                    crm_cd, 
+                    status_id, 
+                    NULLIF(lat, '')::FLOAT, 
+                    NULLIF(lon, '')::FLOAT, 
+                    NULLIF(vict_age, '')::FLOAT
                 FROM staging.crime_buffer
                 WHERE dr_no IS NOT NULL
                 ON CONFLICT (dr_no) DO NOTHING;
