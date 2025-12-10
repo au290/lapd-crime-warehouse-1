@@ -2,20 +2,26 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import os
 
-LOCAL_CSV_PATH = "data_historis.csv"
+# [FIX] Gunakan path absolut agar file terbaca di dalam Docker
+# Pastikan file 'data_historis.csv' Anda simpan di folder 'scripts/' laptop Anda
+LOCAL_CSV_PATH = "/opt/airflow/scripts/data_historis.csv"
 DB_CONN = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
 
 def upload_historical_data():
     if not os.path.exists(LOCAL_CSV_PATH):
         print(f"❌ Error: File {LOCAL_CSV_PATH} not found.")
+        print("   -> Pastikan file csv ada di folder 'scripts/' dan volume docker sudah dimount.")
         return
 
     print("🔌 Connecting to Postgres (Staging Area)...")
     engine = create_engine(DB_CONN)
     
-    # [FIX] Ensure staging schema exists
+    # [FIX] Reset Staging Table (Agar tidak duplikat/error tipe data)
     with engine.connect() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
+        print("   -> Cleaning up old staging table...")
+        # Drop table dengan CASCADE untuk membersihkan metadata lama
+        conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
 
     print(f"📖 Reading {LOCAL_CSV_PATH}...")
     chunk_size = 10000
@@ -26,7 +32,7 @@ def upload_historical_data():
             for i, chunk in enumerate(reader):
                 chunk.columns = chunk.columns.str.lower().str.replace(' ', '_')
                 
-                # [FIX] Rename columns to match Staging Schema
+                # Rename columns sesuai Schema
                 rename_map = {
                     'area': 'area_id',
                     'premis_cd': 'premis_id',
@@ -37,7 +43,7 @@ def upload_historical_data():
                 
                 print(f"   -> Uploading chunk {i+1} ({len(chunk)} rows) to 'staging.crime_buffer'...")
                 
-                # [FIX] Load into 'staging'
+                # [FIX] Gunakan 'append' karena kita sudah DROP di awal
                 chunk.to_sql(
                     'crime_buffer', 
                     engine, 

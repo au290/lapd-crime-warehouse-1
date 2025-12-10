@@ -1,3 +1,5 @@
+# dags/crime_etl_pipeline.py
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime
@@ -8,7 +10,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 from src.extract.lacity_api import fetch_and_upload_crime_data
 from src.transform.fact_cleaner import load_lake_to_staging
-from src.transform.gold_aggregator import merge_staging_to_warehouse
+
+from src.load.warehouse_loader import merge_staging_to_warehouse
 from src.utils.callbacks import send_failure_alert, send_success_alert
 
 default_args = {

@@ -4,19 +4,27 @@ from datetime import datetime
 import sys
 import os
 
+# Tambahkan path root project ke sys.path agar folder 'src' terbaca
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
-# [FIX] Import new modules
-from src.transform.gold_aggregator import merge_staging_to_warehouse
+# [FIX] Import Loader dari folder 'src.load' yang baru
+# Pastikan Anda sudah memindahkan file gold_aggregator.py ke src/load/warehouse_loader.py
+from src.load.warehouse_loader import merge_staging_to_warehouse
+
 from governance.quality_checks.raw_validation import validate_staging_quality
 from src.utils.callbacks import send_failure_alert, send_success_alert
 
 def trigger_ingest_script():
-    # Helper to run the ingest script
+    # Helper untuk menjalankan script ingest yang ada di folder scripts/
+    # Folder ini harus di-mount via docker-compose
     import sys
     sys.path.append('/opt/airflow/scripts')
-    from ingest_historical import upload_historical_data
-    upload_historical_data()
+    
+    try:
+        from ingest_historical import upload_historical_data
+        upload_historical_data()
+    except ImportError:
+        raise ImportError("Module 'ingest_historical' tidak ditemukan. Cek volume mounting di docker-compose!")
 
 default_args = {
     'owner': 'data-engineer',
