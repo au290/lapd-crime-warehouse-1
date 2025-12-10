@@ -19,7 +19,7 @@ st.set_page_config(
 # --- 2. WAREHOUSE CONNECTION ---
 @st.cache_resource
 def get_db_engine():
-    # Connects to the 'warehouse' container
+    # Menggunakan env var dari docker-compose
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     return create_engine(db_conn)
 
@@ -28,7 +28,7 @@ def get_db_engine():
 def load_forecast_model():
     engine = get_db_engine()
     try:
-        # Get the latest model binary from the registry table
+        # Ambil binary model terakhir dari tabel registry
         query = text("""
             SELECT model_blob 
             FROM gold.model_registry 
@@ -41,15 +41,15 @@ def load_forecast_model():
             result = conn.execute(query).fetchone()
             
         if result and result[0]:
-            # Deserialize model
+            # Deserialize model dari bytes
             m = joblib.load(BytesIO(result[0]))
             
-            # Predict
+            # Buat Prediksi
             today = pd.to_datetime('today')
             future = m.make_future_dataframe(periods=30)
             forecast = m.predict(future)
             
-            # Filter: Show last 60 days + next 30 days
+            # Filter tampilan (60 hari terakhir + 30 hari ke depan)
             start_view = today - timedelta(days=60)
             mask = forecast['ds'] >= start_view
             
@@ -192,7 +192,7 @@ def main():
             fig.add_scatter(x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0,100,80,0.2)', showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Model belum tersedia di Database (gold.model_registry).")
+            st.warning("Model belum tersedia di Database (gold.model_registry). Pastikan Pipeline ML sudah jalan.")
 
 if __name__ == "__main__":
     main()

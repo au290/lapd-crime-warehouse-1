@@ -1,42 +1,45 @@
 import pandas as pd
 from sodapy import Socrata
-from sqlalchemy import create_engine
-import os
+from minio import Minio
+from io import BytesIO
 import json
+import os
+from datetime import datetime
 
 def fetch_and_upload_crime_data(**kwargs):
-    # 1. Database Connection
-    # We use the environment variable defined in docker-compose
-    db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
-    engine = create_engine(db_conn)
-    
-    # 2. Extract from API
-    print("📡 Contacting LAPD API (Socrata)...")
-    client = Socrata("data.lacity.org", None) # Public access
-    
-    # Fetch 2000 most recent records
+    # 1. Config
+    MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
+    ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    BUCKET_NAME = "raw-lake"
+
+    # 2. Extract
+    print("📡 Extracting data from LAPD API...")
+    client = Socrata("data.lacity.org", None)
     results = client.get("2nrs-mtv8", limit=2000, order="date_occ DESC")
     
     if not results:
         print("⚠️ No data found.")
         return
 
-    print(f"✅ Fetched {len(results)} rows.")
-
-    # 3. Load to Warehouse (Bronze Layer)
-    df = pd.DataFrame(results)
+    # 3. Save to Data Lake (MinIO)
+    data_bytes = json.dumps(results).encode('utf-8')
+    data_stream = BytesIO(data_bytes)
     
-    # Convert all columns to string to ensure 'raw' fidelity (handling mixed types)
-    df = df.astype(str)
+    minio_client = Minio(MINIO_ENDPOINT, access_key=ACCESS_KEY, secret_key=SECRET_KEY, secure=False)
     
-    print("💾 Loading into 'bronze.raw_crime'...")
+    # Filename includes timestamp
+    filename = f"crime_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
-    with engine.connect() as conn:
-        # We append to the raw log. 
-        # In a real production setup, you might truncate this table or use a landing table.
-        df.to_sql('raw_crime', engine, schema='bronze', if_exists='append', index=False)
-    
-    print("✅ Extract Task Completed successfully.")
+    print(f"💾 Saving {filename} to MinIO bucket '{BUCKET_NAME}'...")
+    minio_client.put_object(
+        BUCKET_NAME,
+        filename,
+        data_stream,
+        length=len(data_bytes),
+        content_type="application/json"
+    )
+    print("✅ Extraction to Data Lake complete!")
 
 if __name__ == "__main__":
     fetch_and_upload_crime_data()

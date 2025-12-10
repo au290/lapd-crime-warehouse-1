@@ -1,6 +1,5 @@
 version: '3.8'
 
-# --- DEFINISI REUSABLE ---
 x-airflow-common: &airflow-common
   build:
     context: ./docker/airflow
@@ -12,40 +11,37 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__WEBSERVER__SECRET_KEY: 'kunci_rahasia_bebas_apa_saja'
-    # [NEW] Connection string for the Data Warehouse
-    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/1447839141063692341/ue-nFshTa5CgxdJ2gEeiU2iwbxiLH0iE9Ievfk5xnnPZ1D82NIVnFwBmDH4dTbhdDMYF"
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'secret_key'
+    DISCORD_WEBHOOK_URL: "YOUR_DISCORD_WEBHOOK_HERE"
+    # Connections
     WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
+    MINIO_ENDPOINT: minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
-    - ./plugins:/opt/airflow/plugins
-    - ./config:/opt/airflow/config
-    - ./scripts:/opt/airflow/scripts
     - ./governance:/opt/airflow/governance
-  user: "${AIRFLOW_UID:-50000}:0"
+    - ./docker/minio:/opt/minio_scripts
   depends_on:
     - postgres
     - warehouse
+    - minio
 
 services:
-  # --- 1. METADATA DB (For Airflow Internal Use Only) ---
+  # --- 1. METADATA DB ---
   postgres:
     image: postgres:13
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-    volumes:
-      - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
 
-  # --- 2. DATA WAREHOUSE (The New Central Storage) ---
-  # Replaces MinIO. Using a separate Postgres instance.
-  # ... inside docker-compose.yaml ...
+  # --- 2. DATA WAREHOUSE (Postgres) ---
   warehouse:
     image: postgres:15
     environment:
@@ -56,52 +52,56 @@ services:
       - "5439:5432"
     volumes:
       - warehouse-data:/var/lib/postgresql/data
-      # [ADD THIS LINE] This executes any .sql file in this folder on startup
       - ./docker/postgres:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admin -d lapd_warehouse"]
       interval: 10s
       retries: 5
 
-  # --- 3. DASHBOARD (STREAMLIT) ---
-  dashboard:
-    build:
-      context: ./docker/airflow
-      dockerfile: Dockerfile
-    entrypoint: /bin/bash
-    # [FIX] Added --server.address 0.0.0.0 so it is accessible from host
-    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
-    ports:
-      - "8501:8501"
+  # --- 3. DATA LAKE (MinIO) ---
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     environment:
-      # Dashboard needs to know how to connect to the Warehouse
-      WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
-    volumes:
-      - ./src:/opt/airflow/src
-    depends_on:
-      - warehouse
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      retries: 3
 
-  # --- AIRFLOW SERVICES ---
+  # Utility to create buckets automatically
+  create_buckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: -c "sleep 5; mc alias set myminio http://minio:9000 minioadmin minioadmin; mc mb --ignore-existing myminio/raw-lake;"
+
+  # --- 4. AIRFLOW ---
   airflow-webserver:
     <<: *airflow-common
     command: webserver
     ports:
       - "8080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
     depends_on:
-      - airflow-scheduler
+      airflow-scheduler:
+        condition: service_started
 
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
-    hostname: airflow-scheduler
     depends_on:
-      - postgres
-      - warehouse
+      postgres:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
 
   airflow-init:
     <<: *airflow-common
@@ -112,7 +112,20 @@ services:
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: 'admin'
       _AIRFLOW_WWW_USER_PASSWORD: 'admin'
-    user: "0:0"
+
+  # --- 5. DASHBOARD ---
+  dashboard:
+    build:
+      context: ./docker/airflow
+      dockerfile: Dockerfile
+    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src:/opt/airflow/src
+    depends_on:
+      warehouse:
+        condition: service_healthy
 
 volumes:
   postgres-db-volume:

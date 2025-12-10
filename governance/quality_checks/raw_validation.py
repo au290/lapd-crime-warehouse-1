@@ -30,7 +30,6 @@ def validate_bronze_quality(**kwargs):
             raise ValueError("⛔ CRITICAL: Table 'bronze.raw_crime' is EMPTY (0 records). Pipeline STOP.")
         
         # 4. Check Key Column Presence
-        # In the JSON version we checked for 'dr_no'. We do the same here by checking column metadata.
         col_exists = conn.execute(text("""
             SELECT count(*)
             FROM information_schema.columns 

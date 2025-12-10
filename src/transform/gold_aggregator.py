@@ -1,84 +1,65 @@
 from sqlalchemy import create_engine, text
 import os
 
-def aggregate_crime_by_area(**kwargs):
-    # 1. Connection
+def merge_staging_to_warehouse(**kwargs):
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     engine = create_engine(db_conn)
     
-    print("🌟 Building Gold Layer (Star Schema)...")
+    print("🏭 Merging Staging Data into Warehouse...")
 
     with engine.connect() as conn:
-        # Use a transaction block
         trans = conn.begin()
         try:
-            # ---------------------------------------------------------
-            # 1. DIMENSION TABLES (Created from unique values in Silver)
-            # ---------------------------------------------------------
+            # 1. Dimensions (Insert New Keys)
+            dims = {
+                'dim_area': ('area_id', 'area_name'),
+                'dim_crime': ('crm_cd', 'crm_cd_desc'),
+                'dim_status': ('status_id', 'status_desc')
+            }
             
-            # DIM_AREA
-            print("   -> Rebuilding gold.dim_area...")
-            conn.execute(text("DROP TABLE IF EXISTS gold.dim_area CASCADE;"))
-            conn.execute(text("""
-                CREATE TABLE gold.dim_area AS
-                SELECT DISTINCT area_id, area_name 
-                FROM silver.crime_log
-                WHERE area_id != 'Unknown';
-            """))
-            conn.execute(text("ALTER TABLE gold.dim_area ADD PRIMARY KEY (area_id);"))
+            for table, (id_col, name_col) in dims.items():
+                print(f"   -> Updating {table}...")
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS warehouse.{table} ({id_col} TEXT PRIMARY KEY, {name_col} TEXT);
+                    
+                    INSERT INTO warehouse.{table} ({id_col}, {name_col})
+                    SELECT DISTINCT {id_col}, {name_col} FROM staging.crime_buffer
+                    WHERE {id_col} IS NOT NULL
+                    ON CONFLICT ({id_col}) DO NOTHING;
+                """))
 
-            # DIM_CRIME
-            print("   -> Rebuilding gold.dim_crime...")
-            conn.execute(text("DROP TABLE IF EXISTS gold.dim_crime CASCADE;"))
+            # 2. Fact Table (Upsert / Deduplicate)
+            print("   -> Updating fact_crime...")
+            # Create Fact Table if not exists
             conn.execute(text("""
-                CREATE TABLE gold.dim_crime AS
-                SELECT DISTINCT crm_cd, crm_cd_desc 
-                FROM silver.crime_log
-                WHERE crm_cd != 'Unknown';
+                CREATE TABLE IF NOT EXISTS warehouse.fact_crime (
+                    dr_no TEXT PRIMARY KEY,
+                    date_occ TIMESTAMP,
+                    area_id TEXT,
+                    crm_cd TEXT,
+                    status_id TEXT,
+                    lat FLOAT,
+                    lon FLOAT,
+                    vict_age FLOAT
+                );
             """))
-            conn.execute(text("ALTER TABLE gold.dim_crime ADD PRIMARY KEY (crm_cd);"))
 
-            # DIM_STATUS
-            print("   -> Rebuilding gold.dim_status...")
-            conn.execute(text("DROP TABLE IF EXISTS gold.dim_status CASCADE;"))
+            # Insert new records (Ignore duplicates via ON CONFLICT)
             conn.execute(text("""
-                CREATE TABLE gold.dim_status AS
-                SELECT DISTINCT status_id, status_desc 
-                FROM silver.crime_log
-                WHERE status_id != 'Unknown';
+                INSERT INTO warehouse.fact_crime (dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age)
+                SELECT DISTINCT dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age 
+                FROM staging.crime_buffer
+                WHERE dr_no IS NOT NULL
+                ON CONFLICT (dr_no) DO NOTHING;
             """))
-            conn.execute(text("ALTER TABLE gold.dim_status ADD PRIMARY KEY (status_id);"))
-
-            # ---------------------------------------------------------
-            # 2. FACT TABLE
-            # ---------------------------------------------------------
-            print("   -> Rebuilding gold.fact_crime...")
-            conn.execute(text("DROP TABLE IF EXISTS gold.fact_crime CASCADE;"))
-            conn.execute(text("""
-                CREATE TABLE gold.fact_crime AS
-                SELECT 
-                    dr_no,
-                    date_occ,
-                    area_id,
-                    crm_cd,
-                    status_id,
-                    weapon_id,
-                    premis_id,
-                    vict_age,
-                    lat,
-                    lon
-                FROM silver.crime_log;
-            """))
-            # Add Primary Key
-            conn.execute(text("ALTER TABLE gold.fact_crime ADD PRIMARY KEY (dr_no);"))
-
+            
             trans.commit()
-            print("✅ Star Schema Successfully Built in PostgreSQL.")
+            print("✅ Warehouse Update Complete!")
             
         except Exception as e:
             trans.rollback()
-            print(f"❌ Error building Gold layer: {e}")
+            print(f"❌ Error: {e}")
             raise e
 
 if __name__ == "__main__":
-    aggregate_crime_by_area()
+    merge_staging_to_warehouse()

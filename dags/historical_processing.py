@@ -8,7 +8,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 from src.transform.fact_cleaner import clean_and_load_to_silver
 from src.transform.gold_aggregator import aggregate_crime_by_area
-from governance.quality_checks.raw_validation import validate_raw_json_structure as validate_bronze_quality
+
+# [FIX] Import the correct function name directly
+from governance.quality_checks.raw_validation import validate_bronze_quality
 from src.utils.callbacks import send_failure_alert, send_success_alert
 
 default_args = {
@@ -28,20 +30,19 @@ with DAG(
     tags=['history', 'manual', 'postgres']
 ) as dag:
 
-    # Task 1: Validation (Check the historical table in Bronze)
+    # Task 1: Validation
     validate_task = PythonOperator(
         task_id='validate_historical_data',
         python_callable=validate_bronze_quality
     )
 
-    # Task 2: Transform (Bronze -> Silver)
-    # The function clean_and_load_to_silver now reads from DB directly
+    # Task 2: Transform
     transform_task = PythonOperator(
         task_id='process_historical_bronze',
         python_callable=clean_and_load_to_silver
     )
 
-    # Task 3: Aggregate (Silver -> Gold)
+    # Task 3: Aggregate
     aggregate_task = PythonOperator(
         task_id='aggregate_history_gold',
         python_callable=aggregate_crime_by_area

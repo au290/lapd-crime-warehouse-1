@@ -3,6 +3,7 @@ pandas
 sodapy
 psycopg2-binary
 sqlalchemy
+minio
 pyarrow
 requests
 streamlit
