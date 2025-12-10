@@ -1,6 +1,6 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from datetime import datetime, timedelta
+from datetime import datetime
 import sys
 import os
 
@@ -16,15 +16,15 @@ default_args = {
 with DAG(
     '3_train_forecasting_model',
     default_args=default_args,
-    description='Melatih ulang model Prophet setiap hari',
-    schedule_interval='0 6 * * *', # Jalan jam 6 pagi (setelah ETL subuh)
+    description='Retrain Prophet Model using Data from Warehouse',
+    schedule_interval='0 6 * * *',
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['machine-learning', 'prophet']
+    tags=['machine-learning', 'prophet', 'postgres']
 ) as dag:
 
     train_task = PythonOperator(
-        task_id='train_prophet_model',
+        task_id='train_prophet_model_db',
         python_callable=train_and_save_model
     )
 

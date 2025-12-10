@@ -4,14 +4,15 @@ from datetime import datetime, timedelta
 import sys
 import os
 
-# Setup path agar bisa import script dari folder scripts/
+# Setup path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
 def trigger_backup_wrapper():
-    # Import di dalam fungsi untuk menghindari error path saat Airflow parsing awal
+    # Dynamic import to avoid path errors during parsing
     import sys
     sys.path.append('/opt/airflow/scripts')
-    from backup_minio import perform_backup
+    # Assumes you renamed backup_minio.py to backup_warehouse.py
+    from backup_warehouse import perform_backup
     perform_backup()
 
 default_args = {
@@ -25,15 +26,15 @@ default_args = {
 with DAG(
     '99_disaster_recovery_backup',
     default_args=default_args,
-    description='Melakukan Snapshot Backup harian ke Archive Bucket',
-    schedule_interval='0 23 * * *', # Jalan tiap jam 23:00 malam
+    description='Performs pg_dump of the Warehouse Database',
+    schedule_interval='0 23 * * *', 
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['disaster-recovery', 'maintenance']
+    tags=['disaster-recovery', 'postgres']
 ) as dag:
 
     backup_task = PythonOperator(
-        task_id='execute_minio_snapshot',
+        task_id='execute_db_backup',
         python_callable=trigger_backup_wrapper
     )
 

@@ -1,60 +1,42 @@
 import pandas as pd
 from sodapy import Socrata
-from minio import Minio
-from io import BytesIO
-import json
-from datetime import datetime
+from sqlalchemy import create_engine
 import os
+import json
 
 def fetch_and_upload_crime_data(**kwargs):
-    # 1. Konfigurasi Koneksi (Biasanya ditaruh di .env, tapi kita hardcode dulu untuk tes)
-    MINIO_ENDPOINT = "minio:9000"  # Hostname internal docker
-    ACCESS_KEY = "minioadmin"
-    SECRET_KEY = "minioadmin"
-    BUCKET_NAME = "crime-bronze"
+    # 1. Database Connection
+    # We use the environment variable defined in docker-compose
+    db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
+    engine = create_engine(db_conn)
     
-    # 2. Tarik Data dari API LAPD (Socrata)
-    print("Mengubungi API LAPD...")
-    client = Socrata("data.lacity.org", None) # App Token None (Public access limits apply)
+    # 2. Extract from API
+    print("📡 Contacting LAPD API (Socrata)...")
+    client = Socrata("data.lacity.org", None) # Public access
     
-    # Mengambil 2000 data terbaru (Limit agar cepat saat testing)
+    # Fetch 2000 most recent records
     results = client.get("2nrs-mtv8", limit=2000, order="date_occ DESC")
     
     if not results:
-        print("Tidak ada data yang ditemukan.")
+        print("⚠️ No data found.")
         return
 
-    # 3. Konversi ke JSON Bytes
-    print(f"Berhasil menarik {len(results)} data.")
-    data_bytes = json.dumps(results).encode('utf-8')
-    data_stream = BytesIO(data_bytes)
+    print(f"✅ Fetched {len(results)} rows.")
+
+    # 3. Load to Warehouse (Bronze Layer)
+    df = pd.DataFrame(results)
     
-    # 4. Upload ke MinIO (Data Lake Layer: Bronze)
-    client_minio = Minio(
-        MINIO_ENDPOINT,
-        access_key=ACCESS_KEY,
-        secret_key=SECRET_KEY,
-        secure=False
-    )
+    # Convert all columns to string to ensure 'raw' fidelity (handling mixed types)
+    df = df.astype(str)
     
-    # Nama file unik berdasarkan tanggal hari ini
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    object_name = f"raw_crime_{today_str}.json"
+    print("💾 Loading into 'bronze.raw_crime'...")
     
-    # Cek apakah bucket ada (Safe guard)
-    if not client_minio.bucket_exists(BUCKET_NAME):
-        client_minio.make_bucket(BUCKET_NAME)
+    with engine.connect() as conn:
+        # We append to the raw log. 
+        # In a real production setup, you might truncate this table or use a landing table.
+        df.to_sql('raw_crime', engine, schema='bronze', if_exists='append', index=False)
     
-    print(f"Mengupload {object_name} ke bucket {BUCKET_NAME}...")
-    client_minio.put_object(
-        BUCKET_NAME,
-        object_name,
-        data_stream,
-        length=len(data_bytes),
-        content_type="application/json"
-    )
-    print("Upload Selesai!")
+    print("✅ Extract Task Completed successfully.")
 
 if __name__ == "__main__":
-    # Untuk testing manual lewat terminal (python src/extract/lacity_api.py)
     fetch_and_upload_crime_data()

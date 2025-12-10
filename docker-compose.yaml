@@ -1,6 +1,6 @@
 version: '3.8'
 
-# --- DEFINISI REUSABLE (Perbaikan ada di sini: &airflow-common) ---
+# --- DEFINISI REUSABLE ---
 x-airflow-common: &airflow-common
   build:
     context: ./docker/airflow
@@ -12,11 +12,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW_CONN_MINIO_S3: 'aws://minioadmin:minioadmin@?host=http%3A%2F%2Fminio%3A9000'
-    # ----------------------------------------------------------------
-    # TAMBAHKAN BARIS DI BAWAH INI:
-    AIRFLOW__WEBSERVER__SECRET_KEY: 'kunci_rahasia_bebas_apa_saja' 
-    # ----------------------------------------------------------------
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'kunci_rahasia_bebas_apa_saja'
+    # [NEW] Connection string for the Data Warehouse
+    WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -27,10 +25,10 @@ x-airflow-common: &airflow-common
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     - postgres
-    - minio
+    - warehouse
 
 services:
-  # --- DATABASE METADATA AIRFLOW ---
+  # --- 1. METADATA DB (For Airflow Internal Use Only) ---
   postgres:
     image: postgres:13
     environment:
@@ -44,51 +42,44 @@ services:
       interval: 5s
       retries: 5
 
-  # --- MINIO (DATA LAKE STORAGE) ---
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+  # --- 2. DATA WAREHOUSE (The New Central Storage) ---
+  # Replaces MinIO. Using a separate Postgres instance.
+  # ... inside docker-compose.yaml ...
+  warehouse:
+    image: postgres:15
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: lapd_warehouse
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "5439:5432"
     volumes:
-      - minio-data-volume:/data
+      - warehouse-data:/var/lib/postgresql/data
+      # [ADD THIS LINE] This executes any .sql file in this folder on startup
+      - ./docker/postgres:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      test: ["CMD-SHELL", "pg_isready -U admin -d lapd_warehouse"]
+      interval: 10s
+      retries: 5
 
-  # --- MINIO BUCKET CREATOR ---
-  create_buckets:
-    image: minio/mc
-    depends_on:
-      - minio
-    entrypoint: /bin/sh
-    volumes:
-      - ./docker/minio/create_buckets.sh:/create_buckets.sh
-    command: /create_buckets.sh
-
-# --- DASHBOARD (STREAMLIT) ---
-  # --- DASHBOARD (STREAMLIT) ---
+  # --- 3. DASHBOARD (STREAMLIT) ---
   dashboard:
     build:
       context: ./docker/airflow
       dockerfile: Dockerfile
-    # [FIX] Paksa container menggunakan Bash
     entrypoint: /bin/bash
-    # [FIX] Tambahkan --server.maxMessageSize 1000 agar bisa kirim data besar
-    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0 --server.maxMessageSize 1000"
+    # [FIX] Added --server.address 0.0.0.0 so it is accessible from host
+    command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
     ports:
       - "8501:8501"
+    environment:
+      # Dashboard needs to know how to connect to the Warehouse
+      WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
     volumes:
       - ./src:/opt/airflow/src
     depends_on:
-      - minio
-      
+      - warehouse
+
   # --- AIRFLOW SERVICES ---
   airflow-webserver:
     <<: *airflow-common
@@ -109,7 +100,7 @@ services:
     hostname: airflow-scheduler
     depends_on:
       - postgres
-      - minio
+      - warehouse
 
   airflow-init:
     <<: *airflow-common
@@ -124,4 +115,4 @@ services:
 
 volumes:
   postgres-db-volume:
-  minio-data-volume:
+  warehouse-data:
