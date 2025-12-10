@@ -14,6 +14,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__WEBSERVER__SECRET_KEY: 'kunci_rahasia_bebas_apa_saja'
     # [NEW] Connection string for the Data Warehouse
+    DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE"
     WAREHOUSE_CONN: postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse
   volumes:
     - ./dags:/opt/airflow/dags

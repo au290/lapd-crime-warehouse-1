@@ -1,41 +1,53 @@
 import pandas as pd
-from minio import Minio
-from io import BytesIO
-import json
+from sqlalchemy import create_engine
 import os
 
-# --- KONFIGURASI ---
+# --- CONFIGURATION ---
 LOCAL_CSV_PATH = "data_historis.csv"
-MINIO_BUCKET = "crime-bronze"
+# We default to the warehouse connection string
+DB_CONN = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
 
 def upload_historical_data():
     if not os.path.exists(LOCAL_CSV_PATH):
-        print(f"Error: File {LOCAL_CSV_PATH} tidak ditemukan.")
+        print(f"❌ Error: File {LOCAL_CSV_PATH} not found.")
         return
 
-    print("Membaca file CSV historis...")
-    df = pd.read_csv(LOCAL_CSV_PATH)
-    
-    print("Mengkonversi ke JSON...")
-    records = df.to_dict(orient='records')
-    json_bytes = json.dumps(records).encode('utf-8')
-    data_stream = BytesIO(json_bytes)
+    print("🔌 Connecting to Data Warehouse...")
+    engine = create_engine(DB_CONN)
 
-    client = Minio("localhost:9000", access_key="minioadmin", secret_key="minioadmin", secure=False)
+    print(f"📖 Reading {LOCAL_CSV_PATH}...")
+    
+    # We use chunks to handle large history files efficiently
+    chunk_size = 10000
+    total_rows = 0
+    
+    try:
+        # Create an iterator to read the file in pieces
+        with pd.read_csv(LOCAL_CSV_PATH, chunksize=chunk_size) as reader:
+            for i, chunk in enumerate(reader):
+                
+                # Normalize columns to match our API schema (lowercase, no spaces)
+                chunk.columns = chunk.columns.str.lower().str.replace(' ', '_')
+                
+                # Convert to string to ensure raw fidelity (Bronze Layer)
+                chunk = chunk.astype(str)
+                
+                print(f"   -> Uploading chunk {i+1} ({len(chunk)} rows)...")
+                
+                # Append to the Bronze table
+                chunk.to_sql(
+                    'raw_crime', 
+                    engine, 
+                    schema='bronze', 
+                    if_exists='append', 
+                    index=False
+                )
+                total_rows += len(chunk)
 
-    # [FIX] Nama file statis khusus history agar tidak menimpa daily ingest
-    object_name = "raw_crime_historical_master.json" 
-    
-    print(f"Mengupload {object_name} ({len(records)} baris) ke {MINIO_BUCKET}...")
-    
-    client.put_object(
-        MINIO_BUCKET,
-        object_name,
-        data_stream,
-        length=len(json_bytes),
-        content_type="application/json"
-    )
-    print("✅ Upload Sukses! File historis aman.")
+        print(f"✅ SUCCESS! Loaded {total_rows} historical records into 'bronze.raw_crime'.")
+        
+    except Exception as e:
+        print(f"❌ Error during upload: {e}")
 
 if __name__ == "__main__":
     upload_historical_data()

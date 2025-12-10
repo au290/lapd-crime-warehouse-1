@@ -1,32 +1,31 @@
 import requests
 import logging
+import os
 from airflow.models import Variable
 
-# --- KONFIGURASI ---
-# 1. Masukkan Webhook URL Anda
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1447839141063692341/ue-nFshTa5CgxdJ2gEeiU2iwbxiLH0iE9Ievfk5xnnPZ1D82NIVnFwBmDH4dTbhdDMYF"
-
-# 2. Masukkan Discord User ID untuk di-tag saat error
-# Cara dapat ID: Di Discord, aktifkan Developer Mode -> Klik Kanan Profil Anda -> Copy ID
-DISCORD_USER_ID = "902058850599993404" 
+# --- CONFIGURATION ---
+# Try to get from Airflow Variables first, then Env Var, then fallback (or fail)
+# In Airflow UI: Admin -> Variables -> Key: DISCORD_WEBHOOK_URL
+DISCORD_WEBHOOK_URL = Variable.get("DISCORD_WEBHOOK_URL", default_var=os.getenv("DISCORD_WEBHOOK_URL"))
+DISCORD_USER_ID = Variable.get("DISCORD_USER_ID", default_var=os.getenv("DISCORD_USER_ID", "902058850599993404"))
 
 def send_discord_message(payload):
-    """Fungsi helper untuk kirim request ke Discord"""
-    if "YOUR_WEBHOOK" in DISCORD_WEBHOOK_URL:
-        logging.warning("⚠️ Discord Webhook URL belum di-set!")
+    """Helper function to send request to Discord"""
+    if not DISCORD_WEBHOOK_URL or "YOUR_WEBHOOK" in DISCORD_WEBHOOK_URL:
+        logging.warning("⚠️ Discord Webhook URL is not set. Skipping alert.")
         return
 
     try:
         response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
         response.raise_for_status()
-        logging.info("✅ Notifikasi terkirim ke Discord.")
+        logging.info("✅ Notification sent to Discord.")
     except Exception as e:
-        logging.error(f"❌ Gagal kirim notifikasi: {e}")
+        logging.error(f"❌ Failed to send notification: {e}")
 
 def send_failure_alert(context):
     """
-    Dipanggil saat Task GAGAL.
-    Melakukan TAGGING ke User ID.
+    Called when a Task FAILS.
+    Tags the user and provides a link to the log.
     """
     ti = context.get('task_instance')
     dag_id = ti.dag_id
@@ -35,26 +34,24 @@ def send_failure_alert(context):
     exception = context.get('exception')
 
     payload = {
-        # [PENTING] Tagging User dilakukan di sini
-        "content": f"🚨 **CRITICAL ALERT** <@{DISCORD_USER_ID}>! Task Failed!",
+        "content": f"🚨 **CRITICAL ALERT** <@{DISCORD_USER_ID}>! Warehouse Pipeline Failed!",
         "embeds": [{
-            "title": "❌ Pipeline Gagal Berjalan",
-            "color": 15548997, # Merah
+            "title": "❌ ETL Task Failed",
+            "color": 15548997, # Red
             "fields": [
                 {"name": "DAG", "value": f"`{dag_id}`", "inline": True},
                 {"name": "Task", "value": f"`{task_id}`", "inline": True},
                 {"name": "Error", "value": f"```{str(exception)[:200]}...```", "inline": False}
             ],
-            "description": f"[👉 Klik Disini untuk Memperbaiki]({log_url})",
-            "footer": {"text": "Segera diperiksa ya!"}
+            "description": f"[👉 Click here to fix]({log_url})",
+            "footer": {"text": "Please investigate immediately."}
         }]
     }
     send_discord_message(payload)
 
 def send_success_alert(context):
     """
-    Dipanggil saat Task SUKSES.
-    Hanya info log biasa (Tanpa Tagging).
+    Called when a Task SUCCEEDS.
     """
     ti = context.get('task_instance')
     dag_id = ti.dag_id
@@ -62,13 +59,12 @@ def send_success_alert(context):
     execution_date = context.get('execution_date')
 
     payload = {
-        # Tidak ada tagging user di sini, hanya pesan biasa
-        "content": "✅ **Laporan Status:**",
+        "content": "✅ **Status Report:**",
         "embeds": [{
-            "title": "Task Selesai (Success)",
-            "color": 5763719, # Hijau
-            "description": f"Tugas **{task_id}** pada DAG **{dag_id}** telah berhasil dijalankan.",
-            "footer": {"text": f"Waktu Eksekusi: {execution_date}"}
+            "title": "Warehouse Task Completed",
+            "color": 5763719, # Green
+            "description": f"Task **{task_id}** in DAG **{dag_id}** executed successfully.",
+            "footer": {"text": f"Exec Date: {execution_date}"}
         }]
     }
     send_discord_message(payload)
