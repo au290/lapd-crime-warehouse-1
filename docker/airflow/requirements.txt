@@ -1,0 +1,16 @@
+apache-airflow
+pandas
+minio
+socrata-py
+pyarrow
+fsspec
+s3fs
+requests
+sodapy
+streamlit
+plotly
+duckdb
+pydeck
+joblib
+prophet
+scikit-learn
