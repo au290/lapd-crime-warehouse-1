@@ -7,17 +7,15 @@ import os
 import json
 
 def train_and_save_model(**kwargs):
-    # 1. Connection
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     engine = create_engine(db_conn)
     
-    print("🧠 Starting Prophet Training (Warehouse Mode)...")
+    print("🧠 Starting Prophet Training (Staging -> Warehouse Mode)...")
 
-    # 2. Load Data from Gold Layer
-    # [FILTER] Data 2024/2025 yang tidak lengkap/anomali kita filter di query SQL
+    # [FIX] Read from 'warehouse.fact_crime'
     query = """
         SELECT date_occ as ds, count(*) as y
-        FROM gold.fact_crime
+        FROM warehouse.fact_crime
         WHERE date_occ <= '2023-12-31'
         GROUP BY date_occ
         ORDER BY date_occ
@@ -34,22 +32,19 @@ def train_and_save_model(**kwargs):
 
     print(f"📊 Training on {len(daily_counts)} days of history.")
 
-    # 3. Train Prophet
     m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
     m.fit(daily_counts)
     
     print("✅ Model trained successfully!")
 
-    # 4. Serialize Model to Bytes
     model_buffer = BytesIO()
     joblib.dump(m, model_buffer)
     model_bytes = model_buffer.getvalue()
 
-    # 5. Save to Database (Model Registry)
+    # [FIX] Save to 'warehouse.model_registry'
     with engine.connect() as conn:
-        # Create Registry Table if not exists
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS gold.model_registry (
+            CREATE TABLE IF NOT EXISTS warehouse.model_registry (
                 id SERIAL PRIMARY KEY,
                 model_name VARCHAR(100),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -57,15 +52,14 @@ def train_and_save_model(**kwargs):
             );
         """))
         
-        # Insert Model
-        print("💾 Saving model binary to 'gold.model_registry'...")
+        print("💾 Saving model binary to 'warehouse.model_registry'...")
         conn.execute(
-            text("INSERT INTO gold.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
+            text("INSERT INTO warehouse.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
             {"name": "prophet_crime_v1", "blob": model_bytes}
         )
         conn.commit()
     
-    print("✅ Model saved to Database.")
+    print("✅ Model saved to Warehouse.")
 
 if __name__ == "__main__":
     train_and_save_model()

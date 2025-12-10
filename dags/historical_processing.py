@@ -6,12 +6,17 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
-from src.transform.fact_cleaner import clean_and_load_to_silver
-from src.transform.gold_aggregator import aggregate_crime_by_area
-
-# [FIX] Import the correct function name directly
-from governance.quality_checks.raw_validation import validate_bronze_quality
+# [FIX] Import new modules
+from src.transform.gold_aggregator import merge_staging_to_warehouse
+from governance.quality_checks.raw_validation import validate_staging_quality
 from src.utils.callbacks import send_failure_alert, send_success_alert
+
+def trigger_ingest_script():
+    # Helper to run the ingest script
+    import sys
+    sys.path.append('/opt/airflow/scripts')
+    from ingest_historical import upload_historical_data
+    upload_historical_data()
 
 default_args = {
     'owner': 'data-engineer',
@@ -23,29 +28,29 @@ default_args = {
 with DAG(
     '2_manual_history_processing',
     default_args=default_args,
-    description='Pipeline for Historical CSV -> Postgres',
+    description='Flow: CSV -> Postgres (Staging) -> Postgres (Warehouse)',
     schedule_interval=None,
     start_date=datetime(2023, 1, 1),
     catchup=False,
-    tags=['history', 'manual', 'postgres']
+    tags=['history', 'staging', 'warehouse']
 ) as dag:
 
-    # Task 1: Validation
-    validate_task = PythonOperator(
-        task_id='validate_historical_data',
-        python_callable=validate_bronze_quality
+    # Task 1: Load CSV to Staging
+    t1_ingest = PythonOperator(
+        task_id='load_csv_to_staging',
+        python_callable=trigger_ingest_script
     )
 
-    # Task 2: Transform
-    transform_task = PythonOperator(
-        task_id='process_historical_bronze',
-        python_callable=clean_and_load_to_silver
+    # Task 2: Validate Staging
+    t2_validate = PythonOperator(
+        task_id='validate_staging_data',
+        python_callable=validate_staging_quality
     )
 
-    # Task 3: Aggregate
-    aggregate_task = PythonOperator(
-        task_id='aggregate_history_gold',
-        python_callable=aggregate_crime_by_area
+    # Task 3: Merge Staging to Warehouse
+    t3_merge = PythonOperator(
+        task_id='merge_to_warehouse',
+        python_callable=merge_staging_to_warehouse
     )
 
-    validate_task >> transform_task >> aggregate_task
+    t1_ingest >> t2_validate >> t3_merge

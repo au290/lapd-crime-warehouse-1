@@ -19,19 +19,18 @@ st.set_page_config(
 # --- 2. WAREHOUSE CONNECTION ---
 @st.cache_resource
 def get_db_engine():
-    # Menggunakan env var dari docker-compose
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     return create_engine(db_conn)
 
-# --- 3. LOAD MODEL (FROM DB BLOB) ---
+# --- 3. LOAD MODEL (FROM WAREHOUSE) ---
 @st.cache_data(ttl=3600)
 def load_forecast_model():
     engine = get_db_engine()
     try:
-        # Ambil binary model terakhir dari tabel registry
+        # [FIX] Read from 'warehouse' schema
         query = text("""
             SELECT model_blob 
-            FROM gold.model_registry 
+            FROM warehouse.model_registry 
             WHERE model_name = 'prophet_crime_v1' 
             ORDER BY created_at DESC 
             LIMIT 1
@@ -41,15 +40,12 @@ def load_forecast_model():
             result = conn.execute(query).fetchone()
             
         if result and result[0]:
-            # Deserialize model dari bytes
             m = joblib.load(BytesIO(result[0]))
             
-            # Buat Prediksi
             today = pd.to_datetime('today')
             future = m.make_future_dataframe(periods=30)
             forecast = m.predict(future)
             
-            # Filter tampilan (60 hari terakhir + 30 hari ke depan)
             start_view = today - timedelta(days=60)
             mask = forecast['ds'] >= start_view
             
@@ -62,25 +58,26 @@ def load_forecast_model():
 # --- 4. DATA LOADERS (SQL) ---
 def load_filter_options(engine):
     try:
+        # [FIX] Read from 'warehouse' schema
         with engine.connect() as conn:
-            dates = pd.read_sql("SELECT min(date_occ), max(date_occ) FROM gold.fact_crime", conn).iloc[0]
-            areas = pd.read_sql("SELECT DISTINCT area_name FROM gold.dim_area ORDER BY 1", conn)
-            crimes = pd.read_sql("SELECT DISTINCT crm_cd_desc FROM gold.dim_crime ORDER BY 1", conn)
+            dates = pd.read_sql("SELECT min(date_occ), max(date_occ) FROM warehouse.fact_crime", conn).iloc[0]
+            areas = pd.read_sql("SELECT DISTINCT area_name FROM warehouse.dim_area ORDER BY 1", conn)
+            crimes = pd.read_sql("SELECT DISTINCT crm_cd_desc FROM warehouse.dim_crime ORDER BY 1", conn)
         return dates, areas['area_name'].tolist(), crimes['crm_cd_desc'].tolist()
     except Exception:
         return None, [], []
 
 # --- 5. ANALYTICAL QUERIES (SQL) ---
 def query_analytical_data(engine, start_date, end_date, selected_areas, selected_crimes):
+    # [FIX] Read from 'warehouse' schema
     query = """
         SELECT 
             f.date_occ, da.area_name, dc.crm_cd_desc, 
-            ds.status_desc, dw.weapon_desc, f.vict_age, f.lat, f.lon
-        FROM gold.fact_crime f
-        LEFT JOIN gold.dim_area da ON f.area_id = da.area_id
-        LEFT JOIN gold.dim_crime dc ON f.crm_cd = dc.crm_cd
-        LEFT JOIN gold.dim_status ds ON f.status_id = ds.status_id
-        LEFT JOIN gold.dim_weapon dw ON f.weapon_id = dw.weapon_id
+            ds.status_desc, f.vict_age, f.lat, f.lon
+        FROM warehouse.fact_crime f
+        LEFT JOIN warehouse.dim_area da ON f.area_id = da.area_id
+        LEFT JOIN warehouse.dim_crime dc ON f.crm_cd = dc.crm_cd
+        LEFT JOIN warehouse.dim_status ds ON f.status_id = ds.status_id
         WHERE f.date_occ BETWEEN %(start)s AND %(end)s
         AND f.lat != 0 AND f.lon != 0
     """
@@ -97,11 +94,12 @@ def query_analytical_data(engine, start_date, end_date, selected_areas, selected
     return pd.read_sql(query, engine, params=params)
 
 def query_trend_data(engine, start_date, end_date, selected_areas, selected_crimes):
+    # [FIX] Read from 'warehouse' schema
     query = """
         SELECT f.date_occ, count(*) as "Jumlah"
-        FROM gold.fact_crime f
-        LEFT JOIN gold.dim_area da ON f.area_id = da.area_id
-        LEFT JOIN gold.dim_crime dc ON f.crm_cd = dc.crm_cd
+        FROM warehouse.fact_crime f
+        LEFT JOIN warehouse.dim_area da ON f.area_id = da.area_id
+        LEFT JOIN warehouse.dim_crime dc ON f.crm_cd = dc.crm_cd
         WHERE f.date_occ BETWEEN %(start)s AND %(end)s
     """
     params = {'start': start_date, 'end': end_date}
@@ -117,9 +115,10 @@ def query_trend_data(engine, start_date, end_date, selected_areas, selected_crim
     return pd.read_sql(query, engine, params=params)
 
 def query_kpi_stats(engine, start_date, end_date):
+    # [FIX] Read from 'warehouse' schema
     query = """
         SELECT count(*) as total_cases, avg(vict_age) as avg_age
-        FROM gold.fact_crime
+        FROM warehouse.fact_crime
         WHERE date_occ BETWEEN %(start)s AND %(end)s
     """
     return pd.read_sql(query, engine, params={'start': start_date, 'end': end_date})
@@ -141,7 +140,7 @@ def main():
     sel_crimes = st.sidebar.multiselect("Jenis Kejahatan", crime_opts)
     
     st.title("🚔 LAPD Crime Intelligence")
-    st.caption(f"Warehouse Mode | Data: {s_date} s/d {e_date}")
+    st.caption(f"Warehouse Mode (Staging -> Warehouse) | Data: {s_date} s/d {e_date}")
 
     with st.spinner("Executing SQL Queries..."):
         df = query_analytical_data(engine, s_date, e_date, sel_areas, sel_crimes)
@@ -153,7 +152,6 @@ def main():
         st.warning("Tidak ada data ditemukan.")
         return
 
-    # KPI Metrics
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Kasus", f"{kpi_df['total_cases'][0]:,}")
     c2.metric("Avg Umur", f"{round(kpi_df['avg_age'][0] or 0)} Thn")
@@ -192,7 +190,7 @@ def main():
             fig.add_scatter(x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0,100,80,0.2)', showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Model belum tersedia di Database (gold.model_registry). Pastikan Pipeline ML sudah jalan.")
+            st.warning("Model belum tersedia di 'warehouse.model_registry'.")
 
 if __name__ == "__main__":
     main()

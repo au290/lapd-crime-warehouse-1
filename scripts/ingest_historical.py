@@ -1,10 +1,8 @@
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import os
 
-# --- CONFIGURATION ---
 LOCAL_CSV_PATH = "data_historis.csv"
-# We default to the warehouse connection string
 DB_CONN = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
 
 def upload_historical_data():
@@ -12,39 +10,44 @@ def upload_historical_data():
         print(f"❌ Error: File {LOCAL_CSV_PATH} not found.")
         return
 
-    print("🔌 Connecting to Data Warehouse...")
+    print("🔌 Connecting to Postgres (Staging Area)...")
     engine = create_engine(DB_CONN)
+    
+    # [FIX] Ensure staging schema exists
+    with engine.connect() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
 
     print(f"📖 Reading {LOCAL_CSV_PATH}...")
-    
-    # We use chunks to handle large history files efficiently
     chunk_size = 10000
     total_rows = 0
     
     try:
-        # Create an iterator to read the file in pieces
         with pd.read_csv(LOCAL_CSV_PATH, chunksize=chunk_size) as reader:
             for i, chunk in enumerate(reader):
-                
-                # Normalize columns to match our API schema (lowercase, no spaces)
                 chunk.columns = chunk.columns.str.lower().str.replace(' ', '_')
                 
-                # Convert to string to ensure raw fidelity (Bronze Layer)
-                chunk = chunk.astype(str)
+                # [FIX] Rename columns to match Staging Schema
+                rename_map = {
+                    'area': 'area_id',
+                    'premis_cd': 'premis_id',
+                    'weapon_used_cd': 'weapon_id',
+                    'status': 'status_id'
+                }
+                chunk.rename(columns=rename_map, inplace=True)
                 
-                print(f"   -> Uploading chunk {i+1} ({len(chunk)} rows)...")
+                print(f"   -> Uploading chunk {i+1} ({len(chunk)} rows) to 'staging.crime_buffer'...")
                 
-                # Append to the Bronze table
+                # [FIX] Load into 'staging'
                 chunk.to_sql(
-                    'raw_crime', 
+                    'crime_buffer', 
                     engine, 
-                    schema='bronze', 
+                    schema='staging', 
                     if_exists='append', 
                     index=False
                 )
                 total_rows += len(chunk)
 
-        print(f"✅ SUCCESS! Loaded {total_rows} historical records into 'bronze.raw_crime'.")
+        print(f"✅ SUCCESS! Loaded {total_rows} historical records into 'staging.crime_buffer'.")
         
     except Exception as e:
         print(f"❌ Error during upload: {e}")
