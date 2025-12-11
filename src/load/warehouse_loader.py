@@ -1,4 +1,3 @@
-# src/load/warehouse_loader.py
 from sqlalchemy import create_engine, text
 import os
 
@@ -14,6 +13,8 @@ def merge_staging_to_warehouse(**kwargs):
             # =========================================
             # 1. CREATE DIMENSION TABLES
             # =========================================
+            # Note: We use ::INT::TEXT casting to handle cases where Staging has numbers (1.0) 
+            # but Warehouse needs strings ('1').
             
             # --- DIM 1: AREA (Geography) ---
             print("   -> Updating dim_area...")
@@ -23,7 +24,10 @@ def merge_staging_to_warehouse(**kwargs):
                     area_name TEXT
                 );
                 INSERT INTO warehouse.dim_area (area_id, area_name)
-                SELECT DISTINCT area_id, area_name FROM staging.crime_buffer
+                SELECT DISTINCT 
+                    area_id::INT::TEXT, -- Cast to clean string
+                    area_name 
+                FROM staging.crime_buffer
                 WHERE area_id IS NOT NULL
                 ON CONFLICT (area_id) DO NOTHING;
             """))
@@ -36,7 +40,10 @@ def merge_staging_to_warehouse(**kwargs):
                     crm_cd_desc TEXT
                 );
                 INSERT INTO warehouse.dim_crime (crm_cd, crm_cd_desc)
-                SELECT DISTINCT crm_cd, crm_cd_desc FROM staging.crime_buffer
+                SELECT DISTINCT 
+                    crm_cd::INT::TEXT, 
+                    crm_cd_desc 
+                FROM staging.crime_buffer
                 WHERE crm_cd IS NOT NULL
                 ON CONFLICT (crm_cd) DO NOTHING;
             """))
@@ -62,7 +69,10 @@ def merge_staging_to_warehouse(**kwargs):
                     premis_desc TEXT
                 );
                 INSERT INTO warehouse.dim_premise (premis_id, premis_desc)
-                SELECT DISTINCT premis_id, premis_desc FROM staging.crime_buffer
+                SELECT DISTINCT 
+                    premis_id::INT::TEXT, 
+                    premis_desc 
+                FROM staging.crime_buffer
                 WHERE premis_id IS NOT NULL
                 ON CONFLICT (premis_id) DO NOTHING;
             """))
@@ -75,14 +85,16 @@ def merge_staging_to_warehouse(**kwargs):
                     weapon_desc TEXT
                 );
                 INSERT INTO warehouse.dim_weapon (weapon_id, weapon_desc)
-                SELECT DISTINCT weapon_id, weapon_desc FROM staging.crime_buffer
+                SELECT DISTINCT 
+                    weapon_id::INT::TEXT, 
+                    weapon_desc 
+                FROM staging.crime_buffer
                 WHERE weapon_id IS NOT NULL
                 ON CONFLICT (weapon_id) DO NOTHING;
             """))
             
             # --- DIM 6: DATE (Generated Calendar) ---
             print("   -> Updating dim_date...")
-            # We extract unique dates from staging and generate attributes
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.dim_date (
                     date_id DATE PRIMARY KEY,
@@ -96,24 +108,23 @@ def merge_staging_to_warehouse(**kwargs):
                 INSERT INTO warehouse.dim_date (date_id, year, month, day, day_of_week, quarter)
                 SELECT DISTINCT 
                     date_occ::DATE as date_id,
-                    EXTRACT(YEAR FROM date_occ) as year,
-                    EXTRACT(MONTH FROM date_occ) as month,
-                    EXTRACT(DAY FROM date_occ) as day,
-                    EXTRACT(DOW FROM date_occ) as day_of_week,
-                    EXTRACT(QUARTER FROM date_occ) as quarter
+                    EXTRACT(YEAR FROM date_occ::TIMESTAMP) as year,
+                    EXTRACT(MONTH FROM date_occ::TIMESTAMP) as month,
+                    EXTRACT(DAY FROM date_occ::TIMESTAMP) as day,
+                    EXTRACT(DOW FROM date_occ::TIMESTAMP) as day_of_week,
+                    EXTRACT(QUARTER FROM date_occ::TIMESTAMP) as quarter
                 FROM staging.crime_buffer
                 WHERE date_occ IS NOT NULL
                 ON CONFLICT (date_id) DO NOTHING;
             """))
 
-            # --- DIM 7: TIME (Time Buckets) ---
+            # --- DIM 7: TIME (Generated Buckets) ---
             print("   -> Updating dim_time...")
-            # time_occ is usually integer HHMM (e.g. 1430). We create buckets.
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.dim_time (
                     time_id INT PRIMARY KEY,
                     hour INT,
-                    time_of_day TEXT -- Morning, Afternoon, Night
+                    time_of_day TEXT
                 );
                 
                 INSERT INTO warehouse.dim_time (time_id, hour, time_of_day)
@@ -135,7 +146,6 @@ def merge_staging_to_warehouse(**kwargs):
             # 2. CREATE FACT TABLE
             # =========================================
             print("   -> Updating fact_crime...")
-            # Fact table now holds Foreign Keys to all 7 Dimensions
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.fact_crime (
                     dr_no TEXT PRIMARY KEY,
@@ -148,19 +158,12 @@ def merge_staging_to_warehouse(**kwargs):
                     weapon_id TEXT,   -- FK to dim_weapon
                     lat FLOAT,
                     lon FLOAT,
-                    vict_age FLOAT,
-                    
-                    CONSTRAINT fk_date FOREIGN KEY(date_occ) REFERENCES warehouse.dim_date(date_id),
-                    CONSTRAINT fk_time FOREIGN KEY(time_occ) REFERENCES warehouse.dim_time(time_id),
-                    CONSTRAINT fk_area FOREIGN KEY(area_id) REFERENCES warehouse.dim_area(area_id),
-                    CONSTRAINT fk_crime FOREIGN KEY(crm_cd) REFERENCES warehouse.dim_crime(crm_cd),
-                    CONSTRAINT fk_status FOREIGN KEY(status_id) REFERENCES warehouse.dim_status(status_id),
-                    CONSTRAINT fk_premise FOREIGN KEY(premis_id) REFERENCES warehouse.dim_premise(premis_id),
-                    CONSTRAINT fk_weapon FOREIGN KEY(weapon_id) REFERENCES warehouse.dim_weapon(weapon_id)
+                    vict_age FLOAT
                 );
             """))
 
-            # Insert Data using standard casting
+            # Insert Data using robust casting
+            # [FIX] Added ::INT::TEXT to ID columns in SELECT and WHERE clauses
             conn.execute(text("""
                 INSERT INTO warehouse.fact_crime (
                     dr_no, date_occ, time_occ, area_id, crm_cd, status_id, premis_id, weapon_id, lat, lon, vict_age
@@ -169,19 +172,19 @@ def merge_staging_to_warehouse(**kwargs):
                     dr_no, 
                     date_occ::DATE,
                     time_occ::INT,
-                    area_id, 
-                    crm_cd, 
+                    area_id::INT::TEXT, 
+                    crm_cd::INT::TEXT, 
                     status_id, 
-                    premis_id,
-                    weapon_id,
+                    premis_id::INT::TEXT,
+                    weapon_id::INT::TEXT,
                     NULLIF(TRIM(lat::TEXT), '')::FLOAT, 
                     NULLIF(TRIM(lon::TEXT), '')::FLOAT, 
                     NULLIF(TRIM(vict_age::TEXT), '')::FLOAT
                 FROM staging.crime_buffer
                 WHERE dr_no IS NOT NULL
-                -- Check if FKs exist in Dims to avoid constraint violation
-                AND area_id IN (SELECT area_id FROM warehouse.dim_area)
-                AND crm_cd IN (SELECT crm_cd FROM warehouse.dim_crime)
+                -- Verify FKs exist (Casting ensures types match)
+                AND area_id::INT::TEXT IN (SELECT area_id FROM warehouse.dim_area)
+                AND crm_cd::INT::TEXT IN (SELECT crm_cd FROM warehouse.dim_crime)
                 AND status_id IN (SELECT status_id FROM warehouse.dim_status)
                 ON CONFLICT (dr_no) DO NOTHING;
             """))

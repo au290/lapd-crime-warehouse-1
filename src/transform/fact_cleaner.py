@@ -50,12 +50,12 @@ def load_lake_to_staging(**kwargs):
         print("⚠️ Data is empty.")
         return
 
-    # 3. CLEANING & MAPPING FOR 7 DIMENSIONS
+    # 3. CLEANING & MAPPING
     df.columns = df.columns.str.lower().str.replace(' ', '_')
     
-    # Mapping exact columns from API/CSV to Staging
-    # We ensure we capture descriptions for our new Dimensions
+    # [FIX] Added 'dr_no' to the map so it isn't dropped!
     rename_map = {
+        'dr_no': 'dr_no',  # <--- CRITICAL FIX HERE
         'area': 'area_id',
         'area_name': 'area_name',
         'crm_cd': 'crm_cd',
@@ -73,20 +73,21 @@ def load_lake_to_staging(**kwargs):
         'lon': 'lon'
     }
     
-    # Keep only columns we need and rename them
-    # Use reindex to ignore missing columns (e.g. if weapon_desc is missing)
-    df = df.reindex(columns=rename_map.keys())
+    # Select only existing columns (handles cases where description might be missing)
+    # This prevents the 'reindex' from creating NaNs for missing optional columns
+    existing_cols = [c for c in rename_map.keys() if c in df.columns]
+    df = df[existing_cols].copy()
     df.rename(columns=rename_map, inplace=True)
     
     # Data Type Conversions
     if 'date_occ' in df.columns:
         df['date_occ'] = pd.to_datetime(df['date_occ'], errors='coerce')
         
-    # Standardize IDs (Remove .0 from floats meant to be strings)
+    # Standardize IDs
     for col in ['area_id', 'crm_cd', 'premis_id', 'weapon_id']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int).astype(str)
-            df[col] = df[col].replace('0', None) # Handle nulls
+            df[col] = df[col].replace('0', None)
 
     # 4. Load to Staging
     print("🚚 Loading into 'staging.crime_buffer'...")
@@ -95,7 +96,7 @@ def load_lake_to_staging(**kwargs):
         conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
         
     df.to_sql('crime_buffer', engine, schema='staging', if_exists='replace', index=False)
-    print(f"✅ Loaded {len(df)} rows to Staging (Ready for 7-Dim Schema).")
+    print(f"✅ Loaded {len(df)} rows to Staging.")
 
 if __name__ == "__main__":
     load_lake_to_staging()
