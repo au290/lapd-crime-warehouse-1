@@ -32,12 +32,27 @@ def load_lake_to_staging(**kwargs):
         return
 
     print(f"📥 Processing latest file: {latest_obj.object_name}")
-    response = minio_client.get_object(bucket, latest_obj.object_name)
-    data = json.loads(response.read())
-    response.close()
-    response.release_conn()
-
-    df = pd.DataFrame(data)
+    try:
+        response = minio_client.get_object(bucket, latest_obj.object_name)
+        
+        # [MODIFIKASI] Deteksi Format File (CSV vs JSON)
+        file_name = latest_obj.object_name.lower()
+        
+        if file_name.endswith('.csv'):
+            print("   -> Detected CSV format. Reading as CSV...")
+            # Baca CSV langsung dari response stream
+            df = pd.read_csv(response)
+        else:
+            print("   -> Detected JSON format. Reading as JSON...")
+            data = json.loads(response.read())
+            df = pd.DataFrame(data)
+            
+        response.close()
+        response.release_conn()
+        
+    except Exception as e:
+        print(f"❌ Error reading file content: {e}")
+        return
 
     if df.empty:
         print("⚠️ Extracted data is empty.")
@@ -64,7 +79,7 @@ def load_lake_to_staging(**kwargs):
     print("🚚 Loading into 'staging.crime_buffer'...")
     with engine.connect() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
-        # [CRITICAL FIX] Drop table dengan CASCADE untuk membersihkan tipe data lama yang orphan
+        # Drop table dengan CASCADE untuk membersihkan tipe data lama yang orphan
         conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
         
     # Gunakan 'replace' (aman karena kita sudah drop manual sebelumnya)
