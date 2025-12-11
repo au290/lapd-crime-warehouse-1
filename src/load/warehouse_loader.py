@@ -1,9 +1,9 @@
-# src/transform/warehouse_loader.py
-
+# src/load/warehouse_loader.py
 from sqlalchemy import create_engine, text
 import os
 
 def merge_staging_to_warehouse(**kwargs):
+    # Setup koneksi
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     engine = create_engine(db_conn)
     
@@ -12,7 +12,7 @@ def merge_staging_to_warehouse(**kwargs):
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # 1. Dimensions (Insert New Keys)
+            # 1. Buat Tabel Dimensions
             dims = {
                 'dim_area': ('area_id', 'area_name'),
                 'dim_crime': ('crm_cd', 'crm_cd_desc'),
@@ -30,9 +30,8 @@ def merge_staging_to_warehouse(**kwargs):
                     ON CONFLICT ({id_col}) DO NOTHING;
                 """))
 
-            # 2. Fact Table (Upsert / Deduplicate)
+            # 2. Buat & Update Tabel Fact
             print("   -> Updating fact_crime...")
-            # Create Fact Table if not exists
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.fact_crime (
                     dr_no TEXT PRIMARY KEY,
@@ -46,19 +45,20 @@ def merge_staging_to_warehouse(**kwargs):
                 );
             """))
 
-            # Insert new records (Ignore duplicates via ON CONFLICT)
-            # Includes fix for NULLIF/FLOAT casting
+            # [FIX FINAL] Menangani Tanggal dan Angka sekaligus
+            # 1. NULLIF(date_occ, '')::TIMESTAMP -> Ubah string kosong jadi NULL, lalu convert ke Waktu
+            # 2. NULLIF(TRIM(lat::TEXT), '')::FLOAT -> Ubah text jadi angka (aman dari spasi)
             conn.execute(text("""
                 INSERT INTO warehouse.fact_crime (dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age)
                 SELECT DISTINCT 
                     dr_no, 
-                    date_occ, 
+                    NULLIF(date_occ, '')::TIMESTAMP, 
                     area_id, 
                     crm_cd, 
                     status_id, 
-                    NULLIF(lat, '')::FLOAT, 
-                    NULLIF(lon, '')::FLOAT, 
-                    NULLIF(vict_age, '')::FLOAT
+                    NULLIF(TRIM(lat::TEXT), '')::FLOAT, 
+                    NULLIF(TRIM(lon::TEXT), '')::FLOAT, 
+                    NULLIF(TRIM(vict_age::TEXT), '')::FLOAT
                 FROM staging.crime_buffer
                 WHERE dr_no IS NOT NULL
                 ON CONFLICT (dr_no) DO NOTHING;
