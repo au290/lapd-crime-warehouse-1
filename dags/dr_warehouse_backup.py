@@ -7,11 +7,12 @@ import os
 # Setup path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 
+# [FIX] Import Callback
+from src.utils.callbacks import send_failure_alert, send_success_alert
+
 def trigger_backup_wrapper():
-    # Dynamic import to avoid path errors during parsing
     import sys
     sys.path.append('/opt/airflow/scripts')
-    # Assumes you renamed backup_minio.py to backup_warehouse.py
     from backup_warehouse import perform_backup
     perform_backup()
 
@@ -21,6 +22,9 @@ default_args = {
     'email_on_failure': False,
     'retries': 3,
     'retry_delay': timedelta(minutes=5),
+    # [FIX] Pasang Callback di sini
+    'on_failure_callback': send_failure_alert,
+    'on_success_callback': send_success_alert 
 }
 
 with DAG(

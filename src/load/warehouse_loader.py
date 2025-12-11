@@ -45,14 +45,14 @@ def merge_staging_to_warehouse(**kwargs):
                 );
             """))
 
-            # [FIX FINAL] Menangani Tanggal dan Angka sekaligus
-            # 1. NULLIF(date_occ, '')::TIMESTAMP -> Ubah string kosong jadi NULL, lalu convert ke Waktu
-            # 2. NULLIF(TRIM(lat::TEXT), '')::FLOAT -> Ubah text jadi angka (aman dari spasi)
+            # [FIX UTAMA]
+            # Gunakan casting ::TEXT pada date_occ sebelum NULLIF
+            # Ini mencegah error "invalid input syntax for type timestamp"
             conn.execute(text("""
                 INSERT INTO warehouse.fact_crime (dr_no, date_occ, area_id, crm_cd, status_id, lat, lon, vict_age)
                 SELECT DISTINCT 
                     dr_no, 
-                    NULLIF(date_occ, '')::TIMESTAMP, 
+                    NULLIF(TRIM(date_occ::TEXT), '')::TIMESTAMP, 
                     area_id, 
                     crm_cd, 
                     status_id, 

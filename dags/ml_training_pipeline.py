@@ -7,10 +7,16 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 from src.machine_learning.train_prophet import train_and_save_model
 
+# [FIX] Import Callback
+from src.utils.callbacks import send_failure_alert, send_success_alert
+
 default_args = {
     'owner': 'data-scientist',
     'depends_on_past': False,
     'retries': 1,
+    # [FIX] Pasang Callback
+    'on_failure_callback': send_failure_alert,
+    'on_success_callback': send_success_alert
 }
 
 with DAG(

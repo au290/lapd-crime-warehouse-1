@@ -25,6 +25,8 @@ x-airflow-common: &airflow-common
     - ./src:/opt/airflow/src
     - ./governance:/opt/airflow/governance
     - ./docker/minio:/opt/minio_scripts
+    # [TAMBAHKAN BARIS INI] ---
+    - ./logs:/opt/airflow/logs
   depends_on:
     - postgres
     - warehouse
@@ -116,10 +118,13 @@ services:
       _AIRFLOW_WWW_USER_PASSWORD: 'admin'
 
   # --- 5. DASHBOARD ---
+  # --- 5. DASHBOARD ---
   dashboard:
     build:
       context: ./docker/airflow
       dockerfile: Dockerfile
+    # [FIX] Override entrypoint agar tidak memanggil 'airflow' command
+    entrypoint: /bin/bash
     command: -c "streamlit run /opt/airflow/src/dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
     ports:
       - "8501:8501"
