@@ -12,3 +12,7 @@ pydeck
 joblib
 prophet
 scikit-learn
+# --- TAMBAHAN BARU ---
+xgboost
+statsmodels
+holidays  

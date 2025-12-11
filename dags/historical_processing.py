@@ -40,11 +40,11 @@ def run_business_logic_check_sql(**kwargs):
         if bad_dates > 0: anomalies.append(f"⚠️ Waktu Invalid: {bad_dates} kasus.")
 
         # 2. Umur Negatif
-        bad_age = conn.execute(text("SELECT count(*) FROM staging.crime_buffer WHERE NULLIF(REGEXP_REPLACE(vict_age, '[^0-9.-]', '', 'g'), '')::FLOAT < 0")).scalar()
+        bad_age = conn.execute(text("SELECT count(*) FROM staging.crime_buffer WHERE NULLIF(REGEXP_REPLACE(vict_age::TEXT, '[^0-9.-]', '', 'g'), '')::FLOAT < 0")).scalar()
         if bad_age > 0: anomalies.append(f"⚠️ Umur Invalid: {bad_age} kasus.")
 
         # 3. Null Island
-        bad_loc = conn.execute(text("SELECT count(*) FROM staging.crime_buffer WHERE NULLIF(REGEXP_REPLACE(lat, '[^0-9.-]', '', 'g'), '')::FLOAT = 0 AND NULLIF(REGEXP_REPLACE(lon, '[^0-9.-]', '', 'g'), '')::FLOAT = 0")).scalar()
+        bad_loc = conn.execute(text("SELECT count(*) FROM staging.crime_buffer WHERE NULLIF(REGEXP_REPLACE(lat::TEXT, '[^0-9.-]', '', 'g'), '')::FLOAT = 0 AND NULLIF(REGEXP_REPLACE(lon::TEXT, '[^0-9.-]', '', 'g'), '')::FLOAT = 0")).scalar()
         if bad_loc > 0: anomalies.append(f"⚠️ Lokasi Invalid (0,0): {bad_loc} kasus.")
 
     if anomalies:

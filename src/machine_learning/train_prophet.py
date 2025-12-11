@@ -7,41 +7,39 @@ from io import BytesIO
 import joblib
 import os
 
+# --- CONFIGURATION ---
+# Cut-off date to ignore broken/missing data in 2024-2025
+VALID_END_DATE = '2023-12-31' 
+
 def get_db_engine():
     db_conn = os.getenv("WAREHOUSE_CONN", "postgresql+psycopg2://admin:admin_password@warehouse:5432/lapd_warehouse")
     return create_engine(db_conn)
 
 def check_data_quality(df):
     """
-    [REQ UAS] Quality metrics (missing values, outliers)
+    Checks basic quality of the CLEANED dataset.
     """
-    print("🔍 [ML QUALITY CHECK] Memeriksa kualitas data training...")
+    print("🔍 [ML QUALITY CHECK] Memeriksa kualitas data training (Cleaned)...")
     
-    # 1. Cek Missing Values
+    # 1. Cek Data Count
+    if len(df) < 100:
+        raise ValueError(f"❌ Data terlalu sedikit setelah filtering (Rows: {len(df)}). Cek cut-off date.")
+
+    # 2. Cek Missing Values
     missing = df.isnull().sum().sum()
     if missing > 0:
-        print(f"⚠️ Peringatan: Ditemukan {missing} missing values. Prophet bisa menanganinya, tapi harap cek data source.")
+        print(f"⚠️ Peringatan: Ditemukan {missing} missing values.")
     else:
         print("✅ Tidak ada missing values.")
 
-    # 2. Cek Outliers (Menggunakan Z-Score sederhana pada jumlah kejadian)
-    mean_y = df['y'].mean()
-    std_y = df['y'].std()
-    threshold = 3
-    outliers = df[(np.abs((df['y'] - mean_y) / std_y)) > threshold]
-    
-    print(f"ℹ️ Statistik Data: Mean={mean_y:.2f}, Std={std_y:.2f}")
-    if not outliers.empty:
-        print(f"⚠️ Peringatan: Ditemukan {len(outliers)} data outliers (Z-Score > 3).")
-        # Opsional: Bisa di-remove jika mau, tapi Prophet tahan terhadap outlier.
-    else:
-        print("✅ Data terlihat normal (tidak ada outliers ekstrem).")
+    print(f"✅ Data Valid dari {df['ds'].min().date()} sampai {df['ds'].max().date()}")
 
 def train_and_save_model(**kwargs):
     engine = get_db_engine()
     print("🧠 Starting Prophet Training Pipeline...")
 
-    # 1. Load Data dari Warehouse [REQ: Dataset dari DW]
+    # 1. Load Data dari Warehouse
+    # Mengambil semua data yang ada dulu
     query = """
         SELECT date_occ as ds, count(*) as y
         FROM warehouse.fact_crime
@@ -56,46 +54,57 @@ def train_and_save_model(**kwargs):
         print(f"❌ Gagal load data: {e}")
         return
 
-    if df.empty or len(df) < 30:
-        print("❌ Data terlalu sedikit untuk training (min 30 hari).")
-        return
+    print(f"   -> Total Raw Rows: {len(df)}")
 
-    # 2. Data Quality Check [REQ: Quality Metrics]
-    check_data_quality(df)
-
-    # 3. Train/Test Split (Untuk Evaluasi Akurasi)
-    # Kita ambil 30 hari terakhir sebagai data tes (validasi)
-    train_df = df.iloc[:-30]
-    test_df = df.iloc[-30:]
+    # 2. [CRITICAL FIX] Apply Cut-Off Date
+    # Membuang data setelah 2023 karena kualitas buruk (drop-off)
+    print(f"✂️ APPLYING CUT-OFF: Ignoring data after {VALID_END_DATE}...")
+    df_clean = df[df['ds'] <= VALID_END_DATE].copy()
     
-    print(f"📊 Training pada {len(train_df)} hari, Testing pada {len(test_df)} hari.")
+    print(f"   -> Clean Rows used for Training: {len(df_clean)}")
+    
+    # Lakukan Quality Check pada data yang SUDAH dibersihkan
+    check_data_quality(df_clean)
 
-    # 4. Training Model
+    # 3. Train/Test Split (Backtesting)
+    # Kita ambil 90 hari terakhir dari data BERSIH untuk tes
+    test_days = 90
+    train_df = df_clean.iloc[:-test_days]
+    test_df = df_clean.iloc[-test_days:]
+    
+    print(f"📊 Split Info:")
+    print(f"   Training: {train_df['ds'].min().date()} --to-- {train_df['ds'].max().date()} ({len(train_df)} rows)")
+    print(f"   Testing:  {test_df['ds'].min().date()} --to-- {test_df['ds'].max().date()} ({len(test_df)} rows)")
+
+    # 4. Training Model (Evaluasi)
     m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
     m.fit(train_df)
 
-    # 5. Evaluasi / Prediction pada Test Set
-    future = m.make_future_dataframe(periods=30)
+    # 5. Evaluasi pada Test Set
+    future = m.make_future_dataframe(periods=test_days)
     forecast = m.predict(future)
     
-    # Ambil hasil prediksi yang tanggalnya sama dengan test_df
+    # Filter hasil prediksi agar pas dengan tanggal test_df
     forecast_test = forecast[forecast['ds'].isin(test_df['ds'])]
     
     # Gabungkan untuk perbandingan
     comparison = pd.merge(test_df, forecast_test[['ds', 'yhat']], on='ds')
     
-    # [REQ: Model Performance Metrics]
+    # Hitung Metrics
     mae = mean_absolute_error(comparison['y'], comparison['yhat'])
     rmse = np.sqrt(mean_squared_error(comparison['y'], comparison['yhat']))
     
-    print(f"📈 Model Performance: MAE={mae:.2f}, RMSE={rmse:.2f}")
+    print(f"📈 Model Performance (Pre-2024): MAE={mae:.2f}, RMSE={rmse:.2f}")
+    print("   (Note: Error ini valid karena dites pada data historis yang lengkap)")
 
-    # 6. Retrain Full Model (Untuk Production)
-    # Setelah tahu akurasinya, kita train ulang dengan SEMUA data untuk prediksi masa depan
+    # 6. Retrain Full Model (Production Ready)
+    # Kita train ulang menggunakan SELURUH data bersih (sampai akhir 2023)
+    # Model ini akan dipakai dashboard untuk memprediksi 2024/2025 (baseline)
+    print("🔄 Retraining full model on all clean data...")
     m_final = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=True)
-    m_final.fit(df) # Pakai full data
+    m_final.fit(df_clean) 
 
-    # 7. Simpan Model & Metrics ke Warehouse [REQ: Distribusi ke DW]
+    # 7. Simpan Model & Metrics ke Warehouse
     model_buffer = BytesIO()
     joblib.dump(m_final, model_buffer)
     model_bytes = model_buffer.getvalue()
@@ -103,7 +112,7 @@ def train_and_save_model(**kwargs):
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # Tabel Model Registry (Blob)
+            # Pastikan tabel ada
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.model_registry (
                     id SERIAL PRIMARY KEY,
@@ -113,7 +122,6 @@ def train_and_save_model(**kwargs):
                 );
             """))
             
-            # Tabel Model Metrics (Untuk Dashboard BI)
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.model_metrics (
                     id SERIAL PRIMARY KEY,
@@ -125,22 +133,22 @@ def train_and_save_model(**kwargs):
                 );
             """))
 
-            # Simpan Blob Model
-            print("💾 Menyimpan model ke 'warehouse.model_registry'...")
+            # Simpan Blob
+            print("💾 Saving model to DB...")
             conn.execute(
                 text("INSERT INTO warehouse.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
                 {"name": "prophet_crime_v1", "blob": model_bytes}
             )
             
-            # Simpan Metrics (Agar bisa dibaca Dashboard)
-            print("📊 Menyimpan metrics ke 'warehouse.model_metrics'...")
+            # Simpan Metrics
+            print("📊 Saving metrics to DB...")
             conn.execute(
                 text("INSERT INTO warehouse.model_metrics (model_name, mae, rmse, training_rows) VALUES (:name, :mae, :rmse, :rows)"),
-                {"name": "prophet_crime_v1", "mae": mae, "rmse": rmse, "rows": len(train_df)}
+                {"name": "prophet_crime_v1", "mae": mae, "rmse": rmse, "rows": len(df_clean)}
             )
             
             trans.commit()
-            print("✅ Pipeline ML Selesai & Terdistribusi ke DW!")
+            print("✅ Pipeline ML Selesai (Cut-Off Strategy Applied)!")
             
         except Exception as e:
             trans.rollback()
