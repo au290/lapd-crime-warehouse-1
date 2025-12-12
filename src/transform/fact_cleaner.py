@@ -55,7 +55,7 @@ def load_lake_to_staging(**kwargs):
     
     # [FIX] Added 'dr_no' to the map so it isn't dropped!
     rename_map = {
-        'dr_no': 'dr_no',  # <--- CRITICAL FIX HERE
+        'dr_no': 'dr_no',
         'area': 'area_id',
         'area_name': 'area_name',
         'crm_cd': 'crm_cd',
@@ -74,7 +74,6 @@ def load_lake_to_staging(**kwargs):
     }
     
     # Select only existing columns (handles cases where description might be missing)
-    # This prevents the 'reindex' from creating NaNs for missing optional columns
     existing_cols = [c for c in rename_map.keys() if c in df.columns]
     df = df[existing_cols].copy()
     df.rename(columns=rename_map, inplace=True)
@@ -95,6 +94,7 @@ def load_lake_to_staging(**kwargs):
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
         conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
         
+    # [CHANGED] Added chunksize=50000 to handle larger loads efficiently
     df.to_sql('crime_buffer', engine, schema='staging', if_exists='replace', index=False, chunksize=50000)
     print(f"✅ Loaded {len(df)} rows to Staging.")
 

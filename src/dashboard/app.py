@@ -234,7 +234,17 @@ def main():
         st.subheader("Historical Trends")
         if not df_trend.empty:
             df_trend['MA_7'] = df_trend['Jumlah'].rolling(window=7, min_periods=1).mean()
-            fig = px.area(df_trend, x='date_occ', y='MA_7', template="plotly_dark", labels={'MA_7': 'Daily Cases (7-Day Avg)'})
+            
+            # Added log_y=True to enable logarithmic scale on the Y-axis
+            fig = px.area(
+                df_trend, 
+                x='date_occ', 
+                y='MA_7', 
+                template="plotly_dark", 
+                labels={'MA_7': 'Daily Cases (7-Day Avg)'},
+                log_y=True 
+            )
+            
             fig.update_traces(line_shape='spline', line_width=2)
             st.plotly_chart(fig, use_container_width=True)
         else:
