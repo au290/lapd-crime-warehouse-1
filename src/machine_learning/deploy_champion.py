@@ -83,14 +83,10 @@ def train_and_deploy(**kwargs):
                     model_blob BYTEA
                 );
             """))
-            
-            # Insert Champion Model
             conn.execute(
                 text("INSERT INTO warehouse.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
                 {"name": "xgboost_crime_v1", "blob": model_bytes}
             )
-            
-            # Log Metrics (Static reference from V2 battle for now)
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS warehouse.model_metrics (
                     id SERIAL PRIMARY KEY,

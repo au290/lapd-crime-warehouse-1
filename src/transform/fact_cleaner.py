@@ -95,7 +95,7 @@ def load_lake_to_staging(**kwargs):
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS staging;"))
         conn.execute(text("DROP TABLE IF EXISTS staging.crime_buffer CASCADE;"))
         
-    df.to_sql('crime_buffer', engine, schema='staging', if_exists='replace', index=False)
+    df.to_sql('crime_buffer', engine, schema='staging', if_exists='replace', index=False, chunksize=50000)
     print(f"✅ Loaded {len(df)} rows to Staging.")
 
 if __name__ == "__main__":
