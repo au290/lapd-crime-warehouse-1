@@ -14,10 +14,11 @@ def merge_staging_to_warehouse(**kwargs):
             # 1. CREATE DIMENSION TABLES
             # =========================================
             
-            # Helper SQL for robust date parsing (Handles ISO and US formats)
+            # [FIX] Cast date_occ to ::TEXT before checking 'LIKE'
+            # This allows it to handle both TIMESTAMP (from API) and TEXT (from CSV) columns safely.
             date_parsing_logic = """
                 CASE 
-                    WHEN date_occ LIKE '%/%' THEN TO_DATE(SPLIT_PART(date_occ, ' ', 1), 'MM/DD/YYYY')
+                    WHEN date_occ::TEXT LIKE '%/%' THEN TO_DATE(SPLIT_PART(date_occ::TEXT, ' ', 1), 'MM/DD/YYYY')
                     ELSE date_occ::DATE 
                 END
             """

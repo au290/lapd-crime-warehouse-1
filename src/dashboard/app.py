@@ -48,12 +48,10 @@ def build_query_filters(sel_areas, sel_crimes, sel_weapons, sel_premises):
         
     return where_sql, params
 
-# --- 4. OPTIMIZED DATA LOADERS (LEFT JOIN SAFE MODE) ---
+# --- 4. OPTIMIZED DATA LOADERS ---
 
 def get_kpi_metrics(engine, start_date, end_date, where_sql, params):
-    """
-    Calculates 100% accurate KPIs using LEFT JOIN to prevent data loss.
-    """
+    """100% DATA ACCURACY. Calculates aggregations in the Database."""
     q_params = params.copy()
     q_params.update({'start': start_date, 'end': end_date})
 
@@ -69,7 +67,7 @@ def get_kpi_metrics(engine, start_date, end_date, where_sql, params):
     """
     df_base = pd.read_sql(sql_base, engine, params=q_params)
 
-    # 2. Hotspot (SQL Group By)
+    # 2. Hotspot
     sql_area = f"""
         SELECT da.area_name 
         FROM warehouse.fact_crime f
@@ -86,7 +84,7 @@ def get_kpi_metrics(engine, start_date, end_date, where_sql, params):
     except:
         top_area = "-"
 
-    # 3. Top Weapon (SQL Group By)
+    # 3. Top Weapon
     sql_weapon = f"""
         SELECT dw.weapon_desc 
         FROM warehouse.fact_crime f
@@ -105,13 +103,9 @@ def get_kpi_metrics(engine, start_date, end_date, where_sql, params):
         
     return df_base.iloc[0]['total'], df_base.iloc[0]['avg_age'], top_area, top_weapon
 
-# [FIX] Added underscore to _engine to prevent UnhashableParamError
 @st.cache_data(ttl=300)
 def get_map_data(_engine, start_date, end_date, where_sql, params):
-    """
-    10% DATA SAMPLING for Map.
-    Uses LEFT JOIN to ensure points appear even if metadata is missing.
-    """
+    """10% DATA SAMPLING for Map with LEFT JOIN."""
     q_params = params.copy()
     q_params.update({'start': start_date, 'end': end_date})
     
@@ -129,6 +123,7 @@ def get_map_data(_engine, start_date, end_date, where_sql, params):
     return pd.read_sql(query, _engine, params=q_params)
 
 def get_trend_data(engine, start_date, end_date, where_sql, params):
+    """100% DATA ACCURACY for Trends."""
     q_params = params.copy()
     q_params.update({'start': start_date, 'end': end_date})
     
@@ -163,6 +158,18 @@ def get_raw_data_preview(engine, start_date, end_date, where_sql, params):
         LIMIT 1000
     """
     return pd.read_sql(query, engine, params=q_params)
+
+def get_model_metrics(engine):
+    """Fetches training history for the new Model Comparison Tab."""
+    try:
+        query = """
+            SELECT model_name, created_at, mae, rmse, training_rows
+            FROM warehouse.model_metrics
+            ORDER BY created_at DESC
+        """
+        return pd.read_sql(query, engine)
+    except Exception:
+        return pd.DataFrame()
 
 # --- 5. FORECASTING ---
 def create_features(dates):
@@ -242,18 +249,13 @@ def main():
     st.title("🚔 LAPD Crime Intelligence")
     st.caption(f"⚡ Hybrid Mode: KPIs (100% Data) | Map (10% Sample) | Range: {s_date} to {e_date}")
 
-    # DEBUG: Show raw count check
-    with st.expander("🔧 Debug Info (Check Data Visibility)"):
-        count = pd.read_sql("SELECT count(*) FROM warehouse.fact_crime", engine).iloc[0,0]
-        st.write(f"Total Rows in Warehouse: {count:,}")
-        st.write(f"Query Filter: {where_sql}")
-
     with st.spinner("Analyzing Warehouse Data..."):
         total_cases, avg_age, top_area, top_weapon = get_kpi_metrics(engine, s_date, e_date, where_sql, params)
         df_trend = get_trend_data(engine, s_date, e_date, where_sql, params)
         map_df = get_map_data(engine, s_date, e_date, where_sql, params)
         raw_df = get_raw_data_preview(engine, s_date, e_date, where_sql, params)
         forecast_result = load_forecast_model()
+        model_metrics_df = get_model_metrics(engine) # Fetch Model Metrics
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Cases", f"{total_cases:,}")
@@ -263,7 +265,8 @@ def main():
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🗺️ Geospatial", "📈 Trends", "📋 Raw Data", "🤖 AI Forecast"])
+    # ADDED "🏆 Model Perf" TAB
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🗺️ Geospatial", "📈 Trends", "📋 Raw Data", "🤖 AI Forecast", "🏆 Model Perf"])
 
     with tab1:
         if not map_df.empty:
@@ -299,6 +302,29 @@ def main():
             fig.add_scatter(x=forecast_result['ds'], y=forecast_result['yhat_lower'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip')
             fig.add_scatter(x=forecast_result['ds'], y=forecast_result['yhat_upper'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 204, 150, 0.2)', showlegend=False, hoverinfo='skip')
             st.plotly_chart(fig, use_container_width=True)
+
+    # NEW TAB: MODEL COMPARISON
+    with tab5:
+        st.subheader("🏆 Model Performance History")
+        if not model_metrics_df.empty:
+            # Show Latest Metrics
+            latest = model_metrics_df.iloc[0]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Latest MAE (Error)", f"{latest['mae']:.2f}")
+            m2.metric("Latest RMSE", f"{latest['rmse']:.2f}")
+            m3.metric("Training Rows", f"{latest['training_rows']:,}")
+            
+            st.markdown("### 📊 Error Metrics Over Time")
+            # Melt for bar chart
+            chart_df = model_metrics_df.melt(id_vars=['model_name', 'created_at'], value_vars=['mae', 'rmse'], var_name='Metric', value_name='Error Value')
+            
+            fig = px.bar(chart_df, x='created_at', y='Error Value', color='Metric', barmode='group', hover_data=['model_name'], template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("### 📜 Deployment Log")
+            st.dataframe(model_metrics_df, use_container_width=True)
+        else:
+            st.info("No model metrics found. Run the training pipeline first.")
 
 if __name__ == "__main__":
     main()
