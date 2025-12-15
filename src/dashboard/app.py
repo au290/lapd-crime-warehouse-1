@@ -160,12 +160,14 @@ def get_raw_data_preview(engine, start_date, end_date, where_sql, params):
     return pd.read_sql(query, engine, params=q_params)
 
 def get_model_metrics(engine):
-    """Fetches training history for the new Model Comparison Tab."""
+    """Fetches the latest performance for EACH model type."""
     try:
+        # Uses DISTINCT ON to get the most recent run for each model_name
         query = """
-            SELECT model_name, created_at, mae, rmse, training_rows
+            SELECT DISTINCT ON (model_name) 
+                model_name, created_at, mae, rmse, training_rows
             FROM warehouse.model_metrics
-            ORDER BY created_at DESC
+            ORDER BY model_name, created_at DESC
         """
         return pd.read_sql(query, engine)
     except Exception:
@@ -185,24 +187,44 @@ def create_features(dates):
     X['is_holiday'] = X['ds'].apply(lambda x: 1 if x in us_holidays else 0)
     return X[['day_of_week', 'quarter', 'month', 'year', 'day_of_year', 'week_of_year', 'is_holiday']]
 
+# --- src/dashboard/app.py ---
+
 @st.cache_data(ttl=3600)
-def load_forecast_model():
+def load_forecast_model(model_name):
+    """Dynamically loads a specific model from the DB."""
     engine = get_db_engine()
     try:
-        query = text("SELECT model_blob FROM warehouse.model_registry WHERE model_name = 'xgboost_crime_v1' ORDER BY created_at DESC LIMIT 1")
+        query = text("SELECT model_blob FROM warehouse.model_registry WHERE model_name = :name ORDER BY created_at DESC LIMIT 1")
+        
         with engine.connect() as conn:
-            result = conn.execute(query).fetchone()
+            result = conn.execute(query, {"name": model_name}).fetchone()
+            
         if result and result[0]:
             model = joblib.load(BytesIO(result[0]))
+            
+            # [CHANGE] Set start date to TODAY (Real-time forecast)
             today = pd.to_datetime('today').normalize()
-            future_dates = pd.date_range(start=today - timedelta(days=180), end=today + timedelta(days=90), freq='D')
-            preds = model.predict(create_features(future_dates))
+            
+            # Generate the next 90 days from today
+            future_dates = pd.date_range(start=today, periods=90, freq='D')
+            
+            # Create features for these future dates
+            features = create_features(future_dates)
+            
+            # Predict
+            preds = model.predict(features)
+            
             forecast = pd.DataFrame({'ds': future_dates, 'yhat': preds})
+            
+            # Add Simulated Confidence Intervals
             forecast['yhat_lower'] = forecast['yhat'] * 0.85
             forecast['yhat_upper'] = forecast['yhat'] * 1.15
+            
             return forecast
+            
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error loading {model_name}: {str(e)}"
+        
     return pd.DataFrame()
 
 def load_filter_options(engine):
@@ -254,7 +276,7 @@ def main():
         df_trend = get_trend_data(engine, s_date, e_date, where_sql, params)
         map_df = get_map_data(engine, s_date, e_date, where_sql, params)
         raw_df = get_raw_data_preview(engine, s_date, e_date, where_sql, params)
-        forecast_result = load_forecast_model()
+        # forecast_result = load_forecast_model()
         model_metrics_df = get_model_metrics(engine) # Fetch Model Metrics
 
     c1, c2, c3, c4 = st.columns(4)
@@ -294,37 +316,111 @@ def main():
         st.caption("Showing top 1,000 recent records.")
 
     with tab4:
+        st.subheader("🤖 AI Forecast Playground")
+        
+        # 1. Selector for Model
+        # You can toggle between your Champion (XGBoost) and Challenger (Random Forest)
+        model_choice = st.radio(
+            "Select Model to Visualize:", 
+            ["xgboost_crime_v1", "random_forest_crime_v1"], 
+            horizontal=True
+        )
+        
+        # 2. Load the selected model
+        forecast_result = load_forecast_model(model_choice)
+
+        # 3. Display Result
         if isinstance(forecast_result, str):
-            st.error(forecast_result)
+            st.warning(f"⚠️ Could not load '{model_choice}'. It might not be trained yet.")
+            st.caption(f"Details: {forecast_result}")
+        # ... inside tab4 ...
+
         elif not forecast_result.empty:
-            fig = px.line(forecast_result, x='ds', y='yhat', template="plotly_dark")
-            fig.update_traces(line_color='#00CC96', line_width=3)
+            st.success(f"✅ Showing Forecast using: **{model_choice}**")
+            
+            # Plot
+            fig = px.line(forecast_result, x='ds', y='yhat', template="plotly_dark", title=f"90-Day Crime Forecast ({model_choice})")
+            
+            # --- [FIX START] Define Colors Correctly ---
+            if 'xgboost' in model_choice:
+                line_color = '#00CC96'                # Green
+                fill_color = 'rgba(0, 204, 150, 0.2)' # Transparent Green
+            else:
+                line_color = '#EF553B'                # Red
+                fill_color = 'rgba(239, 85, 59, 0.2)' # Transparent Red
+            # --- [FIX END] ---
+
+            fig.update_traces(line_color=line_color, line_width=3)
+            
+            # Add Confidence Interval Cloud
             fig.add_scatter(x=forecast_result['ds'], y=forecast_result['yhat_lower'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip')
-            fig.add_scatter(x=forecast_result['ds'], y=forecast_result['yhat_upper'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(0, 204, 150, 0.2)', showlegend=False, hoverinfo='skip')
+            
+            # Use the pre-calculated 'fill_color' variable here
+            fig.add_scatter(
+                x=forecast_result['ds'], 
+                y=forecast_result['yhat_upper'], 
+                mode='lines', 
+                line=dict(width=0), 
+                fill='tonexty', 
+                fillcolor=fill_color, 
+                showlegend=False, 
+                hoverinfo='skip'
+            )
+            
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info(f"Model '{model_choice}' not found in database. Run the pipeline '3_train_forecasting_model' first.")
+
 
     # NEW TAB: MODEL COMPARISON
     with tab5:
-        st.subheader("🏆 Model Performance History")
+        st.subheader("🏆 Champion vs Challenger")
+
         if not model_metrics_df.empty:
-            # Show Latest Metrics
-            latest = model_metrics_df.iloc[0]
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Latest MAE (Error)", f"{latest['mae']:.2f}")
-            m2.metric("Latest RMSE", f"{latest['rmse']:.2f}")
-            m3.metric("Training Rows", f"{latest['training_rows']:,}")
-            
-            st.markdown("### 📊 Error Metrics Over Time")
-            # Melt for bar chart
-            chart_df = model_metrics_df.melt(id_vars=['model_name', 'created_at'], value_vars=['mae', 'rmse'], var_name='Metric', value_name='Error Value')
-            
-            fig = px.bar(chart_df, x='created_at', y='Error Value', color='Metric', barmode='group', hover_data=['model_name'], template="plotly_dark")
+            # 1. Prepare Data for Chart
+            # Melt the dataframe to make it suitable for a grouped bar chart
+            chart_df = model_metrics_df.melt(
+                id_vars=['model_name', 'created_at'], 
+                value_vars=['mae', 'rmse'], 
+                var_name='Metric', 
+                value_name='Error Value'
+            )
+
+            # 2. Side-by-Side Bar Chart
+            fig = px.bar(
+                chart_df, 
+                x='Metric', 
+                y='Error Value', 
+                color='model_name', # This creates the comparison
+                barmode='group',
+                text_auto='.2f',
+                title="Model Error Comparison (Lower is Better)",
+                template="plotly_dark",
+                color_discrete_map={
+                    'xgboost_crime_v1': '#00CC96', # Green
+                    'random_forest_crime_v1': '#EF553B' # Red
+                }
+            )
             st.plotly_chart(fig, use_container_width=True)
-            
-            st.markdown("### 📜 Deployment Log")
-            st.dataframe(model_metrics_df, use_container_width=True)
+
+            # 3. Detailed Metrics Table
+            st.markdown("### 📋 Detailed Stats")
+
+            # Formatting for display
+            display_df = model_metrics_df.copy()
+            display_df['mae'] = display_df['mae'].map('{:.2f}'.format)
+            display_df['rmse'] = display_df['rmse'].map('{:.2f}'.format)
+            display_df['created_at'] = pd.to_datetime(display_df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+
+            st.dataframe(
+                display_df[['model_name', 'mae', 'rmse', 'training_rows', 'created_at']], 
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.info("💡 **Tip:** The model with the lower MAE/RMSE is your current Champion.")
         else:
-            st.info("No model metrics found. Run the training pipeline first.")
+            st.info("No model metrics found. Please run the training pipelines.")
 
 if __name__ == "__main__":
     main()
