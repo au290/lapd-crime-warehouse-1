@@ -13,9 +13,6 @@ def get_db_engine():
     return create_engine(db_conn)
 
 def create_features(data):
-    """
-    Feature Engineering (Must match Dashboard logic)
-    """
     X = data.copy()
     us_holidays = holidays.US()
     
@@ -45,7 +42,6 @@ def train_daily_model(**kwargs):
     df['ds'] = pd.to_datetime(df['ds'])
 
     # 2. Dynamic Cut-Off (Up to Yesterday)
-    # This ensures the model learns from the most recent data available
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     print(f"📅 Training Data Cut-off: {yesterday}")
     
@@ -56,7 +52,7 @@ def train_daily_model(**kwargs):
     X_train = create_features(df_clean)
     y_train = df_clean['y']
 
-    # 4. Train Model (Using Champion Params)
+    # 4. Train Model
     model = xgb.XGBRegressor(
         objective='reg:squarederror',
         n_estimators=1000,
@@ -68,7 +64,7 @@ def train_daily_model(**kwargs):
     model.fit(X_train, y_train)
     print("✅ XGBoost Model Retrained.")
 
-    # 5. Save to Database
+    # 5. Save to Database (CLEANED)
     model_buffer = BytesIO()
     joblib.dump(model, model_buffer)
     model_bytes = model_buffer.getvalue()
@@ -76,34 +72,15 @@ def train_daily_model(**kwargs):
     with engine.connect() as conn:
         trans = conn.begin()
         try:
-            # Ensure tables exist
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS warehouse.model_registry (
-                    id SERIAL PRIMARY KEY,
-                    model_name VARCHAR(100),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    model_blob BYTEA
-                );
-            """))
-            
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS warehouse.model_metrics (
-                    id SERIAL PRIMARY KEY,
-                    model_name VARCHAR(100),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    mae FLOAT,
-                    rmse FLOAT,
-                    training_rows INT
-                );
-            """))
-            
             # Save Model
+            print("💾 Saving model binary...")
             conn.execute(
                 text("INSERT INTO warehouse.model_registry (model_name, model_blob) VALUES (:name, :blob)"),
                 {"name": "xgboost_crime_v1", "blob": model_bytes}
             )
             
-            # Save Log (Placeholder metrics for daily run speed)
+            # Save Log (Placeholder metrics for daily run)
+            print("📊 Saving metrics...")
             conn.execute(
                 text("INSERT INTO warehouse.model_metrics (model_name, mae, rmse, training_rows) VALUES (:name, :mae, :rmse, :rows)"),
                 {"name": "xgboost_crime_v1", "mae": 0.0, "rmse": 0.0, "rows": len(df_clean)}
